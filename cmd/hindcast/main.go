@@ -40,6 +40,11 @@ func main() {
 		// killed by the Stop worker's 30s timeout, which would leave
 		// stale .tmp files mid-rename.
 		hook.Guard("autotune", cmdAutoTuneWorker)
+	case "_judge-probe":
+		// Internal: judge a turn read as JSON from stdin, for live-testing
+		// the outcome judge wiring. Underscored / absent from --help.
+		// Usage: echo '{"prompt":..,"response":..}' | HINDCAST_JUDGE=1 hindcast _judge-probe
+		cmdJudgeProbe(args[1:])
 
 	// User-facing CLI.
 	case "install":

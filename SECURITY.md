@@ -8,7 +8,7 @@ Expect a response within a week. Fixes for high-severity issues will be publishe
 
 ## Threat model
 
-hindcast runs entirely on your local machine. It never sends data over the network. Its security posture is what an adversary with various levels of access could learn or do.
+hindcast runs entirely on your local machine and sends nothing over the network by default. Two features are opt-in network exceptions: the `hindcast eval-api` command, and the `HINDCAST_JUDGE=1` outcome judge (see "Outcome judge (opt-in)" below). Its security posture is what an adversary with various levels of access could learn or do.
 
 ### What hindcast stores and where
 
@@ -54,8 +54,8 @@ All directories are 0700, all files 0600.
 - Can write `.hindcast-project` in your cwd to influence which per-project bucket your records land in. Cannot cross projects or escalate.
 
 **Network attacker.**
-- Hook path and MCP server make zero network calls, ever.
-- The `hindcast eval-api` CLI command is the sole network user: it calls the Anthropic Messages API at `https://api.anthropic.com/v1/messages` using `ANTHROPIC_API_KEY` from the environment or a local `.env` file. Only runs when you invoke it manually. Prompts sent to the API are historical prompt text read fresh from `~/.claude/projects/*/*.jsonl` at eval time — not from hindcast's stats-only records.
+- Hook path and MCP server make zero network calls by default. The one exception on the hook path is the opt-in outcome judge (`HINDCAST_JUDGE=1`, see below).
+- The `hindcast eval-api` CLI command is a network user: it calls the Anthropic Messages API at `https://api.anthropic.com/v1/messages` using `ANTHROPIC_API_KEY` from the environment or a local `.env` file. Only runs when you invoke it manually. Prompts sent to the API are historical prompt text read fresh from `~/.claude/projects/*/*.jsonl` at eval time — not from hindcast's stats-only records.
 
 **eval-api prompt exfiltration — explicit.**
 Running `hindcast eval-api` transmits the historical prompt text of N sampled turns to Anthropic's API. **The stats-only storage invariant does NOT apply to eval-api.** It's specifically a measurement tool that needs the prompt to ask Claude "how long would you estimate this would take?" If you have repos with NDA, client, or otherwise sensitive prompts, either:
@@ -64,6 +64,20 @@ Running `hindcast eval-api` transmits the historical prompt text of N sampled tu
 - Or redact the transcripts before running — `eval-api` reads from `~/.claude/projects/*/*.jsonl`; prune or scrub those files first.
 
 The eval-api sampler respects `ANTHROPIC_API_KEY` only; it has no project-allowlist mechanism in v0.1.
+
+**Outcome judge (opt-in) — `HINDCAST_JUDGE=1`.**
+The outcome judge is the one feature that makes a network call on the *hook path*. It is **off unless you explicitly set `HINDCAST_JUDGE=1`**. When on, at each Stop it grades the previous turn (success/partial/fail) by sending to the Anthropic Messages API:
+
+- the previous turn's **user prompt**, and
+- up to the first **6 KB of the assistant's response text** for that turn.
+
+**This breaks the stats-only / no-plaintext invariant for the judged turns** — raw conversation content leaves your machine. Before sending, hindcast runs a **best-effort secret scrub** (`internal/judge.Redact`: provider keys, AWS keys, PEM blocks, JWTs, and `key=value` secrets are replaced with `[REDACTED]`). This is defense-in-depth, **not a guarantee** — novel secret shapes and the response cap's head-truncation mean sensitive bytes can still egress. Other notes:
+
+- The key is resolved via `ANTHROPIC_API_KEY` (env), a `.env` walking up from cwd, or a global `~/.config/hindcast/.env`. Keep that global file `chmod 600` — if it's group/other-readable, hindcast logs a warning to `hook.log` (a passive log, not a terminal prompt) and proceeds to use it.
+- Verdicts are cached at `~/.claude/hindcast/judge-cache/` — one small file per distinct turn holding only `{verdict, model, ts}` (**no prompt or response text**). The cache is a flat, global, content-hashed directory, not per-project. It is cleared by `uninstall` and by a 30-day age-based GC; `hindcast forget <project>` removes that project's `outcomes.jsonl` but **not** the global judge cache (it isn't project-keyed, so a single-project forget can't selectively purge it).
+- The model defaults to `claude-haiku-4-5`; override with `HINDCAST_JUDGE_MODEL`.
+
+If you work with NDA/client/sensitive repos, **leave `HINDCAST_JUDGE` unset** — the default build never sends turn content anywhere.
 
 ### Known limitations (document-only)
 

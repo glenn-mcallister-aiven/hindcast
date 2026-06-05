@@ -15,6 +15,7 @@ import (
 	"github.com/justinstimatze/hindcast/internal/bm25"
 	"github.com/justinstimatze/hindcast/internal/health"
 	"github.com/justinstimatze/hindcast/internal/hook"
+	"github.com/justinstimatze/hindcast/internal/outcome"
 	"github.com/justinstimatze/hindcast/internal/regressor"
 	"github.com/justinstimatze/hindcast/internal/sizes"
 	"github.com/justinstimatze/hindcast/internal/store"
@@ -287,6 +288,16 @@ func doRecord(in recordInput) {
 		hook.Logf("record", "sketch update: %s", err)
 	}
 
+	// Release the project lock NOW — everything below writes to its own
+	// per-file/per-session state, not the record log / BM25 / sketch this
+	// lock guards. Critically, labelPriorTurn may make a 20s judge HTTP
+	// call (HINDCAST_JUDGE=1); holding the non-blocking project lock
+	// across that would make a concurrent same-project Stop fail
+	// AcquireLock and silently drop its turn (the rapid-follow-up drop
+	// v0.6.2 fixed). The deferred Release stays as a safety net for the
+	// early-return error paths above; calling it twice is harmless.
+	_ = lock.Release()
+
 	hook.Logf("record",
 		"recorded: session=%s project=%s task=%s size=%s wall=%ds active=%ds tools=%d files=%d",
 		r.SessionID, r.ProjectHash, r.TaskType, r.SizeBucket,
@@ -304,6 +315,14 @@ func doRecord(in recordInput) {
 		appendAccuracyLine(pend.ProjectHash, pend, r)
 	}
 
+	// Update per-session momentum tracker so next UserPromptSubmit in
+	// the same session can use recent-turn context as an additional
+	// predictor alongside the project×task bucket.
+	if sm, err := store.LoadSessionMomentum(r.SessionID); err == nil {
+		sm.AppendTurn(r.WallSeconds, r.ClaudeActiveSeconds)
+		_ = sm.Save()
+	}
+
 	// Auto-tune: refresh predictor health + regressor models if stale.
 	// Spawned as a detached subprocess so it's not constrained by
 	// recordWorker's 30s timeout — long retunes used to risk getting
@@ -313,13 +332,14 @@ func doRecord(in recordInput) {
 		spawnAutoTuneWorker()
 	}
 
-	// Update per-session momentum tracker so next UserPromptSubmit in
-	// the same session can use recent-turn context as an additional
-	// predictor alongside the project×task bucket.
-	if sm, err := store.LoadSessionMomentum(r.SessionID); err == nil {
-		sm.AppendTurn(r.WallSeconds, r.ClaudeActiveSeconds)
-		_ = sm.Save()
-	}
+	// Behavioral + judge outcome label, LAST: now that this turn (N+1)
+	// completed, label the previous completed turn (N). Done after
+	// momentum/autotune so that if the (opt-in) judge's HTTP call pushes
+	// past the worker's 30s budget and the goroutine is killed, only the
+	// best-effort label is lost — the record, momentum, and autotune
+	// already landed. Deferred by one turn by construction; the last turn
+	// of a session is never labeled (no follow-up to judge it).
+	labelPriorTurn(turns, pend.SessionID, pend.ProjectHash)
 }
 
 // appendAccuracyLine writes one JSONL line per turn to the project's
@@ -372,6 +392,96 @@ func appendAccuracyLine(hash string, pend store.PendingTurn, r store.Record) {
 	}
 	defer f.Close()
 	fmt.Fprintln(f, string(data))
+}
+
+// labelPriorTurn finds the last two completed turns in the transcript
+// tail and labels the earlier one (N) by whether the later one (N+1)
+// looks like a redo/correction of it — the cheap, deterministic half of
+// the dual-label outcome scheme. One row per labeled turn, appended to
+// the project's outcomes.jsonl. Best-effort: any gap (too few turns,
+// missing prompt text, IO error) just skips — the turn goes unlabeled
+// rather than mislabeled. The report dedups on (session_id, turn_ts).
+func labelPriorTurn(turns []transcript.Turn, sessionID, hash string) {
+	// Walk back from the end collecting the two most recent completed
+	// turns: cur (N+1, the evidence) then prev (N, the turn we label).
+	var cur, prev *transcript.Turn
+	for i := len(turns) - 1; i >= 0; i-- {
+		t := &turns[i]
+		// Valid evidence/target only if the turn completed AND wasn't
+		// abandoned (long wall with ~no active time = walked-away or
+		// sleep-resumed). An abandoned turn is neither a real redo signal
+		// nor a real grading target, so skip it on both sides.
+		if t.WallSeconds() <= 0 || store.IsAbandonedTurn(t.WallSeconds(), t.ActiveSeconds) {
+			continue
+		}
+		if cur == nil {
+			cur = t
+			continue
+		}
+		prev = t
+		break
+	}
+	if cur == nil || prev == nil {
+		return // need at least two completed turns to label one
+	}
+	if prev.PromptText == "" || cur.PromptText == "" {
+		return // prompt text is ephemeral; if absent we can't classify
+	}
+
+	gapSec := 0
+	if !cur.PromptTS.IsZero() && !prev.StopTS.IsZero() && cur.PromptTS.After(prev.StopTS) {
+		gapSec = int(cur.PromptTS.Sub(prev.StopTS).Seconds())
+	}
+
+	res := outcome.Classify(prev.PromptText, cur.PromptText, gapSec)
+
+	path, err := store.OutcomesLogPath(hash)
+	if err != nil {
+		return
+	}
+	row := map[string]any{
+		"ts":         time.Now().UTC().Format(time.RFC3339),
+		"session_id": sessionID,
+		// Identity of the turn being labeled — used to dedup on re-runs.
+		"turn_ts":   prev.PromptTS.Format(time.RFC3339Nano),
+		"task_type": string(tags.Classify(firstLine(prev.PromptText))),
+		"label":     string(res.Label),
+		"jaccard":   res.Jaccard,
+		"marker":    res.Marker,
+	}
+	if res.GapSec > 0 {
+		row["gap_sec"] = res.GapSec
+	}
+
+	// Dense label (increment 2): the LLM judge grades the same turn N
+	// from its own content, so the row carries both labels and the
+	// report can measure their agreement. Opt-in (HINDCAST_JUDGE=1) and
+	// fail-open — when off or keyless, the row is behavioral-only.
+	// judgeTurn redacts secrets from prompt+response internally before any
+	// cache-key or API egress, so raw content is passed here directly.
+	if v, jm, ok := judgeTurn(prev.PromptText, prev.ResponseText, toolsSummary(prev.ToolCalls)); ok {
+		row["judge_label"] = v
+		row["judge_model"] = jm
+	}
+
+	data, err := json.Marshal(row)
+	if err != nil {
+		return
+	}
+	// Rotating append (same 10MB×5 policy as the record log) so
+	// outcomes.jsonl can't grow unbounded. Guarded by a dedicated outcomes
+	// lock (NOT the record lock) so the rotate rename chain can't race
+	// concurrent same-project Stops. Best-effort: on lock contention we
+	// skip the write rather than risk a torn rotation — a dropped label is
+	// already an accepted outcome (last turn of a session is never labeled).
+	if lp, err := store.OutcomesLockPath(hash); err == nil {
+		if lk, err := store.AcquireLock(lp); err == nil {
+			defer func() { _ = lk.Release() }()
+			if err := store.AppendLine(path, data); err != nil {
+				hook.Logf("record", "outcomes append: %s", err)
+			}
+		}
+	}
 }
 
 func updateBM25(hash string, promptHashes []uint64, r store.Record, toolCount int) error {
@@ -538,19 +648,33 @@ func doRecordFallback(in recordInput) {
 		}
 	}
 
-	turns, err := transcript.ParseTail(in.TranscriptPath, 4*1024*1024, since)
+	// Parse once over a window wide enough for BOTH jobs: recording the
+	// current turn (filtered to `since` below) and labeling the prior
+	// turn (needs two completed turns visible). 6h ago is always at or
+	// before `since`, so a single wide parse + in-memory filter replaces
+	// what used to be two full transcript parses per fallback Stop.
+	labelSince := time.Now().Add(-6 * time.Hour)
+	allTurns, err := transcript.ParseTail(in.TranscriptPath, 4*1024*1024, labelSince)
 	if err != nil {
 		hook.Logf("record", "fallback parse transcript: %s", err)
 		return
 	}
-	if len(turns) == 0 {
+	if len(allTurns) == 0 {
 		return
 	}
 
-	turn := turns[len(turns)-1]
-
-	// Skip degenerate turns (no wall time means the assistant never responded).
-	if turn.WallSeconds() == 0 {
+	// Current turn = the most recent completed turn at/after the marker
+	// `since` (no wall time means the assistant never responded).
+	var turn transcript.Turn
+	foundTurn := false
+	for i := len(allTurns) - 1; i >= 0; i-- {
+		if !allTurns[i].PromptTS.Before(since) && allTurns[i].WallSeconds() > 0 {
+			turn = allTurns[i]
+			foundTurn = true
+			break
+		}
+	}
+	if !foundTurn {
 		return
 	}
 
@@ -644,6 +768,12 @@ func doRecordFallback(in recordInput) {
 		hook.Logf("record", "fallback sketch update: %s", err)
 	}
 
+	// Release the project lock before the outcome label's (opt-in) judge
+	// HTTP call — same reason as the main path: holding the non-blocking
+	// lock across a network round-trip would drop concurrent same-project
+	// Stops. Deferred Release stays as the error-path safety net.
+	_ = lock.Release()
+
 	hook.Logf("record",
 		"fallback recorded: session=%s project=%s task=%s wall=%ds active=%ds tools=%d files=%d",
 		r.SessionID, r.ProjectHash, r.TaskType,
@@ -657,6 +787,10 @@ func doRecordFallback(in recordInput) {
 	if shouldRetune() {
 		spawnAutoTuneWorker()
 	}
+
+	// Behavioral + judge outcome label, LAST and outside the lock. Reuses
+	// the single wide parse above (allTurns) — no second transcript read.
+	labelPriorTurn(allTurns, r.SessionID, hash)
 }
 
 // fallbackMarkerPath returns the path to the per-session marker file
@@ -719,6 +853,14 @@ func cmdAutoTuneWorker() {
 		_ = lm.Save()
 	}
 	_ = h.Save()
+
+	// GC the judge cache on the same cadence: entries are single-use per
+	// turn and orphan on model/rubric changes, so age them out (30d) to
+	// keep the dir bounded.
+	if removed := store.PruneJudgeCache(30 * 24 * time.Hour); removed > 0 {
+		hook.Logf("autotune", "pruned %d stale judge-cache entries", removed)
+	}
+
 	hook.Logf("autotune", "threshold=%.2f knn-malr=%.2f winner=%s lift=%.2fx n=%d",
 		h.TunedSimThreshold, h.KNNMALRAtThreshold, h.RegressorWinner, h.RegressorLiftVsLadder, h.NPredictions)
 }

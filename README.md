@@ -163,7 +163,7 @@ The expected MALR ordering is kNN &lt; bucket &lt; project &lt; global — if yo
 - `task_type` is classified in-memory at UserPromptSubmit via keyword regex; the prompt is then dropped.
 - BM25 index stores salt-hashed 64-bit tokens, never plaintext. Per-install random 32-byte salt at `~/.claude/hindcast/salt`.
 - Every log / index / salt file is 0600; every directory 0700.
-- Zero network calls in the hook and predictor paths. The only network-using command is `hindcast eval-api` — a legacy A/B tool that evaluates the deprecated anchoring mechanism against the Claude API. Runs only when you invoke it.
+- Zero network calls in the hook and predictor paths **by default**. Two opt-in exceptions: `hindcast eval-api` (a legacy A/B tool, runs only when you invoke it), and the **outcome judge** — enabled with `HINDCAST_JUDGE=1`, it sends the prior turn's prompt + up to 6KB of assistant response text (secret-redacted, best-effort) to the Claude API at Stop to grade success/partial/fail. Off unless you set the env var. See "Outcome judge (opt-in)" in SECURITY.md before enabling.
 - `HINDCAST_SKIP=1` opts a session out of recording entirely.
 - `hindcast show` dumps everything stored. What you see is all there is.
 - `hindcast rotate-salt` regenerates the salt if you believe it's been compromised; records are retained, BM25 indexes rebuild from next turns.

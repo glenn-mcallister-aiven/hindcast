@@ -18,6 +18,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/justinstimatze/hindcast/internal/bm25"
+	"github.com/justinstimatze/hindcast/internal/hook"
 	"github.com/justinstimatze/hindcast/internal/seed"
 	"github.com/justinstimatze/hindcast/internal/sizes"
 	"github.com/justinstimatze/hindcast/internal/store"
@@ -568,26 +569,44 @@ func printArm(label string, errs, signed []float64) {
 }
 
 // loadAPIKey checks the ANTHROPIC_API_KEY env var first, then walks up
-// the directory tree from cwd looking for a .env file that defines it.
+// the directory tree from cwd looking for a .env file that defines it,
+// and finally falls back to a global ~/.config/hindcast/.env.
 // Quoted values (single or double) have their quotes stripped so
 // `ANTHROPIC_API_KEY="sk-..."` works the same as `ANTHROPIC_API_KEY=sk-...`.
+//
+// The global fallback mirrors the sibling slimemold tool
+// (internal/config.Load): it's what lets a global hook resolve a key
+// regardless of cwd. eval-api runs in-repo so the cwd walk-up suffices
+// for it, but the Stop-time outcome judge runs across every project, and
+// a per-repo .env only resolves when cwd is at/under this repo — the
+// global config file is how the judge finds a key from anywhere.
 func loadAPIKey() string {
 	if v := os.Getenv("ANTHROPIC_API_KEY"); v != "" {
 		return stripQuotes(v)
 	}
 	dir, err := os.Getwd()
-	if err != nil {
-		return ""
+	if err == nil {
+		for {
+			if v := readEnvFrom(filepath.Join(dir, ".env")); v != "" {
+				return v
+			}
+			parent := filepath.Dir(dir)
+			if parent == dir {
+				break
+			}
+			dir = parent
+		}
 	}
-	for {
-		if v := readEnvFrom(filepath.Join(dir, ".env")); v != "" {
+	if home, err := os.UserHomeDir(); err == nil {
+		gp := filepath.Join(home, ".config", "hindcast", ".env")
+		// This file becomes the standing key for the always-on judge across
+		// every project; warn (don't refuse) if it's group/other-readable.
+		if info, err := os.Stat(gp); err == nil && info.Mode().Perm()&0o077 != 0 {
+			hook.Logf("judge", "global key file %s is group/other-readable (mode %04o); chmod 600 recommended", gp, info.Mode().Perm())
+		}
+		if v := readEnvFrom(gp); v != "" {
 			return v
 		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			break
-		}
-		dir = parent
 	}
 	return ""
 }

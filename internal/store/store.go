@@ -216,6 +216,24 @@ func LockPath(hash string) (string, error) {
 	return filepath.Join(dir, "lock-"+clean), nil
 }
 
+// OutcomesLockPath is a SEPARATE lock guarding the rotating outcomes.jsonl
+// append. It must not share the record LockPath: outcome labeling happens
+// after the record lock is released (so the judge HTTP call doesn't hold
+// it), and reusing the record lock would make labeling contend with — and
+// drop — concurrent record appends. This lock only serializes outcome
+// writers against each other so maybeRotate's rename chain can't race.
+func OutcomesLockPath(hash string) (string, error) {
+	clean := safeIdent(hash)
+	if clean == "" {
+		return "", fmt.Errorf("invalid project hash")
+	}
+	dir, err := TmpDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "lock-"+clean+"-outcomes"), nil
+}
+
 // EstimatePath is where the hindcast_estimate MCP tool stashes Claude's
 // self-reported estimate for a session. Stop hook reads and unlinks.
 func EstimatePath(sessionID string) (string, error) {
@@ -266,6 +284,87 @@ func AccuracyLogPath(hash string) (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, "accuracy.jsonl"), nil
+}
+
+// OutcomesLogPath is the per-project log where the Stop hook writes one
+// line per turn labeled with the behavioral outcome (redo / moved_on)
+// inferred from the following turn, plus — in increment 2 — an LLM judge
+// label. Same layout as AccuracyLogPath. `hindcast show --outcomes`
+// aggregates it. Instrumentation only: nothing in the predict/inject
+// path reads this yet.
+func OutcomesLogPath(hash string) (string, error) {
+	clean := safeIdent(hash)
+	if clean == "" {
+		return "", fmt.Errorf("invalid project hash")
+	}
+	root, err := HindcastDir()
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(root, "projects", clean)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "outcomes.jsonl"), nil
+}
+
+// OutcomeSegmentPaths returns the active outcomes log plus its rotated
+// segments (.1…), so readers aggregate the retained history rather than
+// only the active segment.
+func OutcomeSegmentPaths(hash string) ([]string, error) {
+	active, err := OutcomesLogPath(hash)
+	if err != nil {
+		return nil, err
+	}
+	return append([]string{active}, rotatedPaths(active)...), nil
+}
+
+// JudgeCacheDir is where the outcome judge caches verdicts, keyed by a
+// content hash of (model, rubric, turn). One file per distinct turn — a
+// turn is judged at most once, ever, even across re-runs. Network-free
+// after the first hit.
+func JudgeCacheDir() (string, error) {
+	root, err := HindcastDir()
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(root, "judge-cache")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+// PruneJudgeCache deletes judge-cache entries older than maxAge. The
+// cache is single-use per turn and grows one small file per distinct
+// turn forever (rubric/model changes orphan old keys), so a periodic
+// age-based sweep keeps it bounded. Best-effort; returns count removed.
+func PruneJudgeCache(maxAge time.Duration) int {
+	dir, err := JudgeCacheDir()
+	if err != nil {
+		return 0
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0
+	}
+	cutoff := time.Now().Add(-maxAge)
+	removed := 0
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().Before(cutoff) {
+			if os.Remove(filepath.Join(dir, e.Name())) == nil {
+				removed++
+			}
+		}
+	}
+	return removed
 }
 
 func GlobalSketchPath() (string, error) {
@@ -378,7 +477,10 @@ func DeleteSalt() error {
 
 var ErrLocked = errors.New("store: project lock is held by a live process")
 
-type Lock struct{ path string }
+type Lock struct {
+	path     string
+	released bool
+}
 
 func AcquireLock(path string) (*Lock, error) {
 	if l, err := tryLock(path); err == nil {
@@ -475,10 +577,17 @@ func processStartTime(pid int) int64 {
 	return v
 }
 
+// Release removes the lock file. Idempotent: a second call is a no-op.
+// This matters because callers legitimately release early on the success
+// path and ALSO defer a Release for the error paths — without the guard,
+// the deferred second os.Remove could delete a *different* worker's lock
+// file if it acquired the same path in the interim, silently breaking
+// mutual exclusion.
 func (l *Lock) Release() error {
-	if l == nil {
+	if l == nil || l.released {
 		return nil
 	}
+	l.released = true
 	return os.Remove(l.path)
 }
 
@@ -567,6 +676,26 @@ func maybeRotate(path string, f *os.File) error {
 		_ = os.Rename(src, dst)
 	}
 	return os.Rename(path, path+".1")
+}
+
+// AppendLine appends one line to a JSONL sidecar log (currently
+// outcomes.jsonl), creating it if needed, and rotates it under the same
+// 10MB×5-segment policy as the record log so it can't grow unbounded.
+// (accuracy.jsonl still uses a raw non-rotating append; migrating it
+// would also require its reader to read rotated segments.)
+func AppendLine(path string, data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(append(data, '\n')); err != nil {
+		f.Close()
+		return err
+	}
+	return maybeRotate(path, f) // closes f
 }
 
 func ReadRecentRecords(path string, n int) ([]Record, error) {

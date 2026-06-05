@@ -30,6 +30,7 @@ type Turn struct {
 	StopTS        time.Time
 	PromptText    string // raw prompt — ephemeral, never persisted
 	ResponseChars int
+	ResponseText  string // ephemeral assistant text, capped — feeds the outcome judge only; never persisted
 	ToolCalls     map[string]int
 	FilesTouched  int
 	Model         string
@@ -47,6 +48,13 @@ func (t Turn) WallSeconds() int {
 // activeGapCap clamps any inter-tool gap above this to this value —
 // approximates "Claude was idle / user was AFK or approving a prompt".
 const activeGapCap = 60 * time.Second
+
+// responseTextCap bounds the ephemeral assistant text captured per turn
+// for the outcome judge. ~6KB is enough for the judge to tell whether
+// the turn landed without ballooning the judge prompt (and its cost) on
+// long responses. The leading text usually carries the "what I did"
+// summary, so a head-truncation loses little signal.
+const responseTextCap = 6000
 
 type rawEntry struct {
 	ParentUUID  *string         `json:"parentUuid"`
@@ -130,6 +138,21 @@ func Parse(r io.Reader, since time.Time) ([]Turn, error) {
 				switch b.Type {
 				case "text":
 					curr.ResponseChars += len(b.Text)
+					// Capture text up to a cap for the outcome judge.
+					// Ephemeral — dropped when the Turn is consumed; never
+					// written to any record.
+					if n := responseTextCap - len(curr.ResponseText); n > 0 {
+						if len(b.Text) <= n {
+							curr.ResponseText += b.Text
+						} else {
+							// Trim n back to a UTF-8 rune boundary so the cap
+							// can't split a multibyte rune mid-sequence.
+							for n > 0 && !utf8.RuneStart(b.Text[n]) {
+								n--
+							}
+							curr.ResponseText += b.Text[:n]
+						}
+					}
 				case "tool_use":
 					curr.ToolCalls[b.Name]++
 					if !lastTool.IsZero() {

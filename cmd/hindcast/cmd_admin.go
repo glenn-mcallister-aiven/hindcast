@@ -39,6 +39,7 @@ func cmdShow(args []string) {
 	limit := fl.Int("n", 10, "show last N records per project")
 	accuracy := fl.Bool("accuracy", false, "report predictor MALR vs actual from accuracy.jsonl")
 	healthFlag := fl.Bool("health", false, "report tuned predictor state from health.json")
+	outcomes := fl.Bool("outcomes", false, "report behavioral outcome labels (redo/moved_on) from outcomes.jsonl")
 	_ = fl.Parse(args)
 
 	if *accuracy {
@@ -47,6 +48,10 @@ func cmdShow(args []string) {
 	}
 	if *healthFlag {
 		showHealth()
+		return
+	}
+	if *outcomes {
+		showOutcomes(*project)
 		return
 	}
 
@@ -603,6 +608,11 @@ func cmdForget(args []string) {
 	for i := 1; i <= 5; i++ {
 		_ = os.Remove(filepath.Join(projectsDir, fmt.Sprintf("%s.jsonl.%d", hash, i)))
 	}
+	// Also drop the per-project subdir (accuracy.jsonl + outcomes.jsonl,
+	// the latter carrying prompt/response-derived judge labels). Records
+	// live as flat projects/<hash>.jsonl, but these sidecars are under
+	// projects/<hash>/ — without this, "forget" left the outcome data.
+	_ = os.RemoveAll(filepath.Join(projectsDir, hash))
 
 	// Rebuild global sketch from remaining projects.
 	sketch := &store.Sketch{MaxSize: store.SketchMaxWindow}
@@ -627,6 +637,212 @@ func cmdForget(args []string) {
 
 	fmt.Fprintf(os.Stderr, "forgot project %s; global sketch rebuilt from %d remaining records\n",
 		hash, rebuilt)
+}
+
+// outcomeRow is one behavioral-outcome line loaded from outcomes.jsonl.
+type outcomeRow struct {
+	SessionID  string  `json:"session_id"`
+	TurnTS     string  `json:"turn_ts"`
+	TaskType   string  `json:"task_type"`
+	Label      string  `json:"label"`
+	Jaccard    float64 `json:"jaccard"`
+	Marker     bool    `json:"marker"`
+	JudgeLabel string  `json:"judge_label,omitempty"` // increment 2
+}
+
+// showOutcomes aggregates outcomes.jsonl across projects and reports the
+// behavioral redo / moved_on base rates — the cheap, objective label that
+// (once the LLM judge lands in increment 2) becomes the validation anchor
+// the judge has to agree with. Instrumentation surface: nothing in the
+// predictor reads this yet, and no success prior is injected.
+func showOutcomes(projectFilter string) {
+	root, err := store.HindcastDir()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "show --outcomes: %s\n", err)
+		os.Exit(1)
+	}
+	projDir := filepath.Join(root, "projects")
+	entries, err := os.ReadDir(projDir)
+	if err != nil {
+		fmt.Println("hindcast: no outcome data yet (labels populate one turn after each turn completes)")
+		return
+	}
+
+	targetHash := ""
+	if projectFilter != "" {
+		if len(projectFilter) == 8 {
+			targetHash = projectFilter
+		} else {
+			targetHash = store.ProjectHash(projectFilter)
+		}
+	}
+
+	// Dedup on (session_id, turn_ts): a turn can be re-labeled if a Stop
+	// re-fires without a new turn. Last write wins.
+	seen := map[string]outcomeRow{}
+	projectCount := 0
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if targetHash != "" && e.Name() != targetHash {
+			continue
+		}
+		segs, err := store.OutcomeSegmentPaths(e.Name())
+		if err != nil {
+			continue
+		}
+		loaded := 0
+		for _, seg := range segs {
+			f, err := os.Open(seg)
+			if err != nil {
+				continue // missing rotated segment
+			}
+			sc := bufio.NewScanner(f)
+			sc.Buffer(make([]byte, 64*1024), 4*1024*1024)
+			for sc.Scan() {
+				var r outcomeRow
+				if err := json.Unmarshal(sc.Bytes(), &r); err != nil {
+					continue
+				}
+				seen[r.SessionID+"|"+r.TurnTS] = r
+				loaded++
+			}
+			f.Close()
+		}
+		if loaded > 0 {
+			projectCount++
+		}
+	}
+
+	if len(seen) == 0 {
+		fmt.Println("hindcast: no outcome data yet (labels populate one turn after each turn completes)")
+		return
+	}
+
+	var redo, movedOn, withJudge int
+	byTask := map[string][2]int{} // task -> [redo, movedOn]
+	// Judge contingency: cell[verdict] = [redo, moved_on] counts, over
+	// the turns that carry BOTH a judge and a behavioral label.
+	cell := map[string][2]int{"success": {}, "partial": {}, "fail": {}}
+	for _, r := range seen {
+		isRedo := r.Label == "redo"
+		t := byTask[r.TaskType]
+		if isRedo {
+			redo++
+			t[0]++
+		} else {
+			movedOn++
+			t[1]++
+		}
+		byTask[r.TaskType] = t
+		if r.JudgeLabel != "" {
+			withJudge++
+			c := cell[r.JudgeLabel]
+			if isRedo {
+				c[0]++
+			} else {
+				c[1]++
+			}
+			cell[r.JudgeLabel] = c
+		}
+	}
+
+	total := len(seen)
+	fmt.Printf("hindcast behavioral outcomes: %d turns labeled across %d project(s)\n\n", total, projectCount)
+	fmt.Printf("  behavioral base rate: redo %d (%.0f%%) · moved_on %d (%.0f%%)\n",
+		redo, pct(redo, total), movedOn, pct(movedOn, total))
+
+	if len(byTask) > 1 {
+		fmt.Printf("\n  by task type:\n")
+		tasks := make([]string, 0, len(byTask))
+		for k := range byTask {
+			tasks = append(tasks, k)
+		}
+		sort.Strings(tasks)
+		for _, k := range tasks {
+			c := byTask[k]
+			n := c[0] + c[1]
+			fmt.Printf("    %-12s n=%-4d redo=%.0f%%\n", k, n, pct(c[0], n))
+		}
+	}
+
+	// Judge vs behavioral. Raw agreement on two skewed signals is base-
+	// rate-inflated (a judge that always says "success" can score high),
+	// so show the full contingency, both marginals, agreement under BOTH
+	// partial-collapse policies, and the chance-corrected Cohen's κ — κ is
+	// the number that actually gates whether the judge is worth trusting.
+	fmt.Printf("\n  judge vs behavioral (n=%d turns with both labels):\n", withJudge)
+	if withJudge == 0 {
+		fmt.Printf("    none yet — enable HINDCAST_JUDGE=1. This cross-tab (not a single %% ) is the gate for any success-prior injection.\n")
+		return
+	}
+	jf, jp, js := cell["fail"], cell["partial"], cell["success"]
+	fmt.Printf("    %-9s %6s %9s\n", "judge\\beh", "redo", "moved_on")
+	fmt.Printf("    %-9s %6d %9d\n", "fail", jf[0], jf[1])
+	fmt.Printf("    %-9s %6d %9d\n", "partial", jp[0], jp[1])
+	fmt.Printf("    %-9s %6d %9d\n", "success", js[0], js[1])
+
+	notSuccessN := jf[0] + jf[1] + jp[0] + jp[1]
+	redoSubset := jf[0] + jp[0] + js[0]
+	fmt.Printf("    marginals: judge fail-or-partial %.0f%% · behavioral redo %.0f%% (of this subset)\n",
+		pct(notSuccessN, withJudge), pct(redoSubset, withJudge))
+
+	// Primary collapse: partial→fail (judge asserts NOT success).
+	a := jf[0] + jp[0] // judge-not-success & redo
+	b := jf[1] + jp[1] // judge-not-success & moved_on
+	c := js[0]         // judge-success & redo
+	d := js[1]         // judge-success & moved_on
+	// Alt collapse: partial→success (judge asserts success unless "fail").
+	a2, d2 := jf[0], jp[1]+js[1]
+	fmt.Printf("    raw agreement: %.0f%% (partial→fail) · %.0f%% (partial→success)\n",
+		pct(a+d, withJudge), pct(a2+d2, withJudge))
+	k := cohenKappa(a, b, c, d)
+	fmt.Printf("    Cohen's κ (partial→fail): %.2f — %s\n", k, kappaGloss(k))
+	fmt.Printf("    (κ corrects for the both-say-fine cell; trust κ over raw agreement here.)\n")
+}
+
+func pct(x, n int) float64 {
+	if n == 0 {
+		return 0
+	}
+	return 100 * float64(x) / float64(n)
+}
+
+// cohenKappa returns chance-corrected agreement for a 2×2 confusion of
+// judge-fail vs behavioral-redo: a=both-positive, b=judge-only,
+// c=behavioral-only, d=both-negative.
+func cohenKappa(a, b, c, d int) float64 {
+	n := float64(a + b + c + d)
+	if n == 0 {
+		return 0
+	}
+	po := float64(a+d) / n
+	pJudgeYes := float64(a+b) / n
+	pBehYes := float64(a+c) / n
+	pe := pJudgeYes*pBehYes + (1-pJudgeYes)*(1-pBehYes)
+	if pe >= 1 {
+		return 0
+	}
+	return (po - pe) / (1 - pe)
+}
+
+// kappaGloss is the standard Landis–Koch banding for a κ value.
+func kappaGloss(k float64) string {
+	switch {
+	case k < 0:
+		return "worse than chance"
+	case k < 0.20:
+		return "slight / none"
+	case k < 0.40:
+		return "fair"
+	case k < 0.60:
+		return "moderate"
+	case k < 0.80:
+		return "substantial"
+	default:
+		return "strong"
+	}
 }
 
 // showHealth prints the persisted tuned predictor state — the result of
