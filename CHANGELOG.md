@@ -4,6 +4,17 @@
 
 (none)
 
+## [0.7.1] — 2026-06-06 — token band "oven timer"
+
+The token band ships off by default (`HINDCAST_TOKENS`), so the user
+records and predicts tokens while "baking" — but nothing signalled when
+the band was ready to enable. Adds a one-time nudge: when a live
+prediction already rests on ≥8 token-bearing samples and injection is
+still off, the pending hook prints a reminder to enable `HINDCAST_TOKENS=1`
+(tracked by a marker file so it never repeats; delete
+`~/.claude/hindcast/.token-nudge-shown` to re-arm). The tool rings its own
+timer instead of relying on the user to remember to check.
+
 ## [0.7.0] — 2026-06-06 — token-cost dimension
 
 Adds a token-cost prediction dimension alongside wall/active, reusing the

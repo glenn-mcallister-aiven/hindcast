@@ -98,6 +98,17 @@ func ProjectsDir() (string, error) {
 	return dir, nil
 }
 
+// TokenNudgeMarkerPath is the once-only flag for the "token band has
+// matured, consider enabling injection" reminder. Its presence means the
+// nudge has already fired; deleting it re-arms the reminder.
+func TokenNudgeMarkerPath() (string, error) {
+	root, err := HindcastDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, ".token-nudge-shown"), nil
+}
+
 func ProjectHash(project string) string {
 	sum := md5.Sum([]byte(project))
 	return hex.EncodeToString(sum[:])[:8]

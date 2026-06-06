@@ -1,11 +1,55 @@
 package main
 
 import (
+	"bytes"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/justinstimatze/hindcast/internal/predict"
 )
+
+// The oven timer: tokenNudgeReady gates on a populated band with enough
+// token-bearing support; emitTokenNudgeOnce fires exactly once.
+func TestTokenNudgeReady(t *testing.T) {
+	cases := []struct {
+		name string
+		p    predict.Prediction
+		want bool
+	}{
+		{"no token band", predict.Prediction{Tokens: 0, TokensN: 20}, false},
+		{"band but thin support", predict.Prediction{Tokens: 200_000, TokensN: tokenNudgeMinN - 1}, false},
+		{"matured", predict.Prediction{Tokens: 200_000, TokensN: tokenNudgeMinN}, true},
+	}
+	for _, c := range cases {
+		if got := tokenNudgeReady(c.p); got != c.want {
+			t.Errorf("%s: tokenNudgeReady = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+func TestEmitTokenNudgeOnce(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), ".token-nudge-shown")
+
+	var buf bytes.Buffer
+	if !emitTokenNudgeOnce(&buf, marker, 12) {
+		t.Fatal("first call should emit")
+	}
+	if !strings.Contains(buf.String(), "HINDCAST_TOKENS=1") {
+		t.Errorf("nudge should tell the user to set the flag, got: %q", buf.String())
+	}
+	if !strings.Contains(buf.String(), "12") {
+		t.Errorf("nudge should cite the support count, got: %q", buf.String())
+	}
+
+	buf.Reset()
+	if emitTokenNudgeOnce(&buf, marker, 12) {
+		t.Error("second call must NOT emit (marker exists)")
+	}
+	if buf.Len() != 0 {
+		t.Errorf("second call must write nothing, got: %q", buf.String())
+	}
+}
 
 // TestFormatClaudeInjectionTierGate exercises the tier gate. Only
 // regressor / knn / bucket / project should emit; global / none must

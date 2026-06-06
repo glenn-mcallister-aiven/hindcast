@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"strings"
@@ -147,6 +148,52 @@ func cmdPending() {
 			fmt.Println(s)
 		}
 	}
+
+	// Oven timer: the token band is gated behind HINDCAST_TOKENS, and the
+	// user is "baking" — recording/predicting tokens but not injecting them
+	// yet, waiting for the band to mature. Nothing otherwise tells them when
+	// it's ready. So once the current prediction already rests on enough
+	// token-bearing samples but injection is still off, fire a one-time
+	// reminder. Independent of the wall inject's arm/HINDCAST_INJECT gates —
+	// this is a maintenance nudge, not part of the A/B experiment. It prints
+	// to stdout (additionalContext) so Claude sees it and can offer to flip
+	// the flag — the "tool reminds you" pattern, not "remember to check".
+	if os.Getenv("HINDCAST_TOKENS") != "1" && tokenNudgeReady(pred) {
+		if mp, err := store.TokenNudgeMarkerPath(); err == nil {
+			emitTokenNudgeOnce(os.Stdout, mp, pred.TokensN)
+		}
+	}
+}
+
+// tokenNudgeMinN is how many token-bearing samples the current prediction
+// must rest on before the oven timer rings. Higher than the inject's
+// "good support" floor (5) so the reminder waits for a solidly-backed band,
+// not a borderline one that might regress.
+const tokenNudgeMinN = 8
+
+// tokenNudgeReady reports whether the token band has matured enough to
+// suggest enabling injection.
+func tokenNudgeReady(p predict.Prediction) bool {
+	return p.Tokens > 0 && p.TokensN >= tokenNudgeMinN
+}
+
+// emitTokenNudgeOnce writes the "oven's done" reminder to w if markerPath
+// doesn't already exist, then creates the marker so it never fires twice.
+// Returns true if it emitted. Best-effort: marker write errors are ignored
+// (worst case the nudge repeats, which is harmless).
+func emitTokenNudgeOnce(w io.Writer, markerPath string, n int) bool {
+	if markerPath == "" {
+		return false
+	}
+	if _, err := os.Stat(markerPath); err == nil {
+		return false // already shown
+	}
+	fmt.Fprintf(w, "hindcast: token-cost calibration has matured (now backed by %d token-bearing "+
+		"turns), but token injection is still OFF. To start showing the token band, set "+
+		"HINDCAST_TOKENS=1 in settings.json env — eyeball `hindcast predict \"<a typical prompt>\"` "+
+		"first. This reminder fires once.\n", n)
+	_ = os.WriteFile(markerPath, []byte("shown\n"), 0o644)
+	return true
 }
 
 // formatClaudeInjection renders the prediction as a Claude-facing block
