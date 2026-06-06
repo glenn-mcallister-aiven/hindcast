@@ -63,10 +63,28 @@ type Prediction struct {
 	// superset of the existing distribution so there's no model to
 	// overfit. Populated by the kNN tier only; bucket / project tiers
 	// leave them zero.
-	WallP10      int     `json:"wall_p10,omitempty"`
-	WallP90      int     `json:"wall_p90,omitempty"`
-	ActiveP10    int     `json:"active_p10,omitempty"`
-	ActiveP90    int     `json:"active_p90,omitempty"`
+	WallP10   int `json:"wall_p10,omitempty"`
+	WallP90   int `json:"wall_p90,omitempty"`
+	ActiveP10 int `json:"active_p10,omitempty"`
+	ActiveP90 int `json:"active_p90,omitempty"`
+	// Token cost (schema v2). Same machinery as wall/active — weighted
+	// kNN median + shrunk quantiles, or unweighted quantiles in the
+	// bucket/project tiers. Populated only when ≥tokenMinSamples neighbors
+	// in the chosen tier carry token data (pre-v2 records have none), so
+	// these stay zero until enough token-bearing turns accrue. The render
+	// layer suppresses the token line while they're zero.
+	Tokens    int `json:"tokens,omitempty"`
+	TokensP25 int `json:"tokens_p25,omitempty"`
+	TokensP75 int `json:"tokens_p75,omitempty"`
+	TokensP10 int `json:"tokens_p10,omitempty"`
+	TokensP90 int `json:"tokens_p90,omitempty"`
+	// TokensN is how many samples actually backed the token figure. Token
+	// cost is sparse (only v2+ token-bearing turns contribute), so this is
+	// usually < N — the token band rests on a filtered, non-random subset
+	// of the neighbors/records that backed wall. Surfaced separately so the
+	// inject doesn't overstate token support with wall's N, and used to
+	// gate the token variance band.
+	TokensN      int     `json:"tokens_n,omitempty"`
 	N            int     `json:"n"`                 // neighbors used
 	MaxSim       float64 `json:"max_sim,omitempty"` // top neighbor similarity (knn or regressor's bm25 feature)
 	Source       Source  `json:"source"`
@@ -157,6 +175,7 @@ func Predict(queryHashes []uint64, idx *bm25.Index, records []store.Record, sk *
 		if len(good) >= 3 {
 			walls := make([]weighted, 0, len(good))
 			actives := make([]weighted, 0, len(good))
+			tokens := make([]weighted, 0, len(good))
 			now := time.Now().UTC()
 			for _, m := range good {
 				// v0.6.3: weight = sim × recency. Recency decays older
@@ -167,6 +186,13 @@ func Predict(queryHashes []uint64, idx *bm25.Index, records []store.Record, sk *
 				w := m.Sim * recencyWeight(m.Doc.TS, now)
 				walls = append(walls, weighted{float64(m.Doc.WallSeconds), w})
 				actives = append(actives, weighted{float64(m.Doc.ActiveSeconds), w})
+				// Token cost is sparse — only v2+ docs carry it. Skip
+				// zero-token neighbors so old turns don't drag the median
+				// to zero; the token band only fires once enough
+				// token-bearing neighbors are in range.
+				if m.Doc.Tokens > 0 {
+					tokens = append(tokens, weighted{float64(m.Doc.Tokens), w})
+				}
 			}
 			n := len(good)
 			medianWall := weightedMedian(walls)
@@ -193,6 +219,7 @@ func Predict(queryHashes []uint64, idx *bm25.Index, records []store.Record, sk *
 			}
 			shrinkWall := func(q float64) float64 { return clamp(medianWall + (q-medianWall)*factor) }
 			shrinkActive := func(q float64) float64 { return clamp(medianActive + (q-medianActive)*factor) }
+			tokMed, tokP25, tokP75, tokP10, tokP90 := weightedTokenQuantiles(tokens)
 			return Prediction{
 				WallSeconds:   int(medianWall + 0.5),
 				ActiveSeconds: int(medianActive + 0.5),
@@ -204,6 +231,12 @@ func Predict(queryHashes []uint64, idx *bm25.Index, records []store.Record, sk *
 				ActiveP75:     int(shrinkActive(weightedQuantile(actives, 0.75)) + 0.5),
 				ActiveP10:     int(shrinkActive(weightedQuantile(actives, 0.10)) + 0.5),
 				ActiveP90:     int(shrinkActive(weightedQuantile(actives, 0.90)) + 0.5),
+				Tokens:        tokMed,
+				TokensP25:     tokP25,
+				TokensP75:     tokP75,
+				TokensP10:     tokP10,
+				TokensP90:     tokP90,
+				TokensN:       len(tokens),
 				N:             n,
 				MaxSim:        good[0].Sim,
 				Source:        SourceKNN,
@@ -213,26 +246,33 @@ func Predict(queryHashes []uint64, idx *bm25.Index, records []store.Record, sk *
 	}
 
 	// --- task-type bucket ---
-	var bucketWalls, bucketActives []float64
+	var bucketWalls, bucketActives, bucketTokens []float64
 	for _, r := range records {
 		if r.TaskType == taskType {
 			bucketWalls = append(bucketWalls, float64(r.WallSeconds))
 			bucketActives = append(bucketActives, float64(r.ClaudeActiveSeconds))
+			if tc := r.TokenCost(); tc > 0 {
+				bucketTokens = append(bucketTokens, float64(tc))
+			}
 		}
 	}
 	if len(bucketWalls) >= 4 {
-		return quantilePrediction(bucketWalls, bucketActives, SourceBucket, taskType)
+		return quantilePrediction(bucketWalls, bucketActives, bucketTokens, SourceBucket, taskType)
 	}
 
 	// --- overall project ---
 	if len(records) >= 4 {
 		allWalls := make([]float64, 0, len(records))
 		allActives := make([]float64, 0, len(records))
+		var allTokens []float64
 		for _, r := range records {
 			allWalls = append(allWalls, float64(r.WallSeconds))
 			allActives = append(allActives, float64(r.ClaudeActiveSeconds))
+			if tc := r.TokenCost(); tc > 0 {
+				allTokens = append(allTokens, float64(tc))
+			}
 		}
-		return quantilePrediction(allWalls, allActives, SourceProject, taskType)
+		return quantilePrediction(allWalls, allActives, allTokens, SourceProject, taskType)
 	}
 
 	// --- global sketch ---
@@ -245,7 +285,9 @@ func Predict(queryHashes []uint64, idx *bm25.Index, records []store.Record, sk *
 		for i, v := range sk.Active {
 			actives[i] = float64(v)
 		}
-		return quantilePrediction(walls, actives, SourceGlobal, taskType)
+		// No token tier from the global sketch — it carries only wall/active,
+		// and the inject path suppresses SourceGlobal anyway.
+		return quantilePrediction(walls, actives, nil, SourceGlobal, taskType)
 	}
 
 	// SourceNone: every tier refused. Pass len(records) through as N so
@@ -293,13 +335,17 @@ func weightedMedian(ws []weighted) float64 {
 	return weightedQuantile(ws, 0.5)
 }
 
-func quantilePrediction(walls, actives []float64, src Source, taskType string) Prediction {
+func quantilePrediction(walls, actives, tokens []float64, src Source, taskType string) Prediction {
 	wm := unweightedQuantile(walls, 0.5)
 	wp25 := unweightedQuantile(walls, 0.25)
 	wp75 := unweightedQuantile(walls, 0.75)
 	am := unweightedQuantile(actives, 0.5)
 	ap25 := unweightedQuantile(actives, 0.25)
 	ap75 := unweightedQuantile(actives, 0.75)
+	// Mirror wall exactly in this tier: only P25/P75, no P10/P90 (the
+	// duration tiers leave the wide quantiles to kNN). Keeps the token band
+	// and the wall band at the same coverage level so they're comparable.
+	tokMed, tokP25, tokP75 := unweightedTokenQuantiles(tokens)
 	return Prediction{
 		WallSeconds:   int(wm + 0.5),
 		ActiveSeconds: int(am + 0.5),
@@ -307,10 +353,58 @@ func quantilePrediction(walls, actives []float64, src Source, taskType string) P
 		WallP75:       int(wp75 + 0.5),
 		ActiveP25:     int(ap25 + 0.5),
 		ActiveP75:     int(ap75 + 0.5),
+		Tokens:        tokMed,
+		TokensP25:     tokP25,
+		TokensP75:     tokP75,
+		TokensN:       len(tokens),
 		N:             len(walls),
 		Source:        src,
 		TaskType:      taskType,
 	}
+}
+
+// tokenMinSamples is the floor of token-bearing samples a tier needs
+// before it emits a token band. Mirrors the conservative posture of the
+// duration tiers: too few points and we stay silent rather than anchor on
+// a thin number. Pre-v2 records contribute none, so the band activates
+// only once enough token-bearing turns accrue.
+const tokenMinSamples = 3
+
+// weightedTokenQuantiles returns the weighted median plus shrunk
+// P25/P75/P10/P90 for token cost, mirroring the kNN wall/active treatment
+// (small-sample shrinkage widens the band away from the median, clamped at
+// 1). Returns all zeros below tokenMinSamples — the signal to suppress.
+func weightedTokenQuantiles(ws []weighted) (med, p25, p75, p10, p90 int) {
+	if len(ws) < tokenMinSamples {
+		return 0, 0, 0, 0, 0
+	}
+	m := weightedMedian(ws)
+	factor := 1.0 + 0.5/math.Sqrt(float64(len(ws)))
+	shrink := func(q float64) float64 {
+		v := m + (q-m)*factor
+		if v < 1 {
+			v = 1
+		}
+		return v
+	}
+	return int(m + 0.5),
+		int(shrink(weightedQuantile(ws, 0.25)) + 0.5),
+		int(shrink(weightedQuantile(ws, 0.75)) + 0.5),
+		int(shrink(weightedQuantile(ws, 0.10)) + 0.5),
+		int(shrink(weightedQuantile(ws, 0.90)) + 0.5)
+}
+
+// unweightedTokenQuantiles is the bucket/project-tier analog: plain
+// empirical median/P25/P75, no shrinkage and no wide quantiles — mirrors
+// the duration tiers, which also leave P10/P90 to kNN. Returns all zeros
+// below tokenMinSamples.
+func unweightedTokenQuantiles(xs []float64) (med, p25, p75 int) {
+	if len(xs) < tokenMinSamples {
+		return 0, 0, 0
+	}
+	return int(unweightedQuantile(xs, 0.5) + 0.5),
+		int(unweightedQuantile(xs, 0.25) + 0.5),
+		int(unweightedQuantile(xs, 0.75) + 0.5)
 }
 
 func unweightedQuantile(xs []float64, q float64) float64 {

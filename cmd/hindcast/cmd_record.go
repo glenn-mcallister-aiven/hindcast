@@ -235,6 +235,9 @@ func doRecord(in recordInput) {
 		ResponseChars:        turn.ResponseChars,
 		ToolCalls:            turn.ToolCalls,
 		FilesTouched:         turn.FilesTouched,
+		OutputTokens:         turn.OutputTokens,
+		SubagentTokens:       turn.SubagentTokens,
+		AgentCount:           turn.AgentCount,
 		Arm:                  pend.Arm,
 		ClaudeEstimateWall:   estWall,
 		ClaudeEstimateActive: estActive,
@@ -509,6 +512,7 @@ func updateBM25(hash string, promptHashes []uint64, r store.Record, toolCount in
 		SizeBucket:    r.SizeBucket,
 		ToolCount:     toolCount,
 		FilesTouched:  r.FilesTouched,
+		Tokens:        r.TokenCost(),
 		TS:            r.TS,
 	})
 	return idx.Save(path)
@@ -574,6 +578,7 @@ func rotateBM25IfNeeded(logPath, hash string) (bool, error) {
 			SizeBucket:    r.SizeBucket,
 			ToolCount:     toolCount,
 			FilesTouched:  r.FilesTouched,
+			Tokens:        r.TokenCost(),
 			TS:            r.TS,
 		})
 	}
@@ -705,6 +710,9 @@ func doRecordFallback(in recordInput) {
 		ResponseChars:       turn.ResponseChars,
 		ToolCalls:           turn.ToolCalls,
 		FilesTouched:        turn.FilesTouched,
+		OutputTokens:        turn.OutputTokens,
+		SubagentTokens:      turn.SubagentTokens,
+		AgentCount:          turn.AgentCount,
 		Arm:                 arm,
 	}
 

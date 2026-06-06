@@ -31,6 +31,64 @@ func TestPredictKNNTierFires(t *testing.T) {
 	}
 }
 
+// kNN token band populates from token-bearing neighbors and stays zero
+// when neighbors carry no token data (pre-v2 docs). Guards the "old index
+// drags the median to zero" hazard the Doc.Tokens skip-zero logic prevents.
+func TestPredictKNNTokenBand(t *testing.T) {
+	tokens := []uint64{1, 2, 3}
+
+	// All neighbors carry token cost → band populates around the median.
+	idx := bm25.New()
+	for i := 0; i < 5; i++ {
+		idx.Add(tokens, bm25.Doc{WallSeconds: 100, ActiveSeconds: 50, Tokens: 200_000, TaskType: "migrate"})
+	}
+	p := Predict(tokens, idx, nil, nil, "migrate", 0)
+	if p.Source != SourceKNN {
+		t.Fatalf("expected SourceKNN, got %s", p.Source)
+	}
+	if p.Tokens != 200_000 {
+		t.Errorf("Tokens = %d, want 200000 (median of equal docs)", p.Tokens)
+	}
+	if !(p.TokensP25 > 0 && p.TokensP75 > 0) {
+		t.Errorf("expected populated token band, got P25=%d P75=%d", p.TokensP25, p.TokensP75)
+	}
+
+	// Same neighbors, no token data → token fields must stay zero (suppressed)
+	// while wall still predicts normally.
+	idx2 := bm25.New()
+	for i := 0; i < 5; i++ {
+		idx2.Add(tokens, bm25.Doc{WallSeconds: 100, ActiveSeconds: 50, TaskType: "migrate"})
+	}
+	p2 := Predict(tokens, idx2, nil, nil, "migrate", 0)
+	if p2.WallSeconds != 100 {
+		t.Errorf("wall should still predict, got %d", p2.WallSeconds)
+	}
+	if p2.Tokens != 0 || p2.TokensP25 != 0 || p2.TokensP75 != 0 {
+		t.Errorf("token fields must be zero without token-bearing docs, got %d/%d/%d",
+			p2.Tokens, p2.TokensP25, p2.TokensP75)
+	}
+}
+
+// Bucket tier emits a token band from token-bearing records and stays
+// silent below tokenMinSamples.
+func TestPredictBucketTokenBand(t *testing.T) {
+	idx := bm25.New()
+	idx.Add([]uint64{99, 100}, bm25.Doc{WallSeconds: 1, TaskType: "migrate"}) // forces kNN miss
+	records := []store.Record{
+		{TaskType: "migrate", WallSeconds: 200, ClaudeActiveSeconds: 100, SubagentTokens: 150_000},
+		{TaskType: "migrate", WallSeconds: 220, ClaudeActiveSeconds: 110, SubagentTokens: 250_000},
+		{TaskType: "migrate", WallSeconds: 180, ClaudeActiveSeconds: 90, SubagentTokens: 100_000},
+		{TaskType: "migrate", WallSeconds: 210, ClaudeActiveSeconds: 105, SubagentTokens: 300_000},
+	}
+	p := Predict([]uint64{1, 2, 3}, idx, records, nil, "migrate", 0)
+	if p.Source != SourceBucket {
+		t.Fatalf("expected SourceBucket, got %s", p.Source)
+	}
+	if p.Tokens <= 0 {
+		t.Errorf("expected populated bucket token median, got %d", p.Tokens)
+	}
+}
+
 // When BM25 sim is below the floor, kNN must NOT fire — the bucket tier
 // catches it. Catches the regression where someone lowers knnMinSim
 // thinking it'll help kNN coverage but actually feeds noise to predict.

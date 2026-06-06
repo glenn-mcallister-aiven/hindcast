@@ -91,8 +91,34 @@ func formatPrediction(p predict.Prediction) string {
 			src = fmt.Sprintf("regressor:%s", p.SourceDetail)
 		}
 	}
-	return fmt.Sprintf("hindcast: ~%s wall / %s active%s · %s n=%d · %s",
-		wall, active, band, src, p.N, tag)
+	tokenPhrase := ""
+	if p.Tokens > 0 {
+		tb := ""
+		if p.TokensP25 > 0 && p.TokensP75 > p.TokensP25 {
+			tb = fmt.Sprintf(" [%s–%s]", humanTokens(p.TokensP25), humanTokens(p.TokensP75))
+		}
+		tokenPhrase = fmt.Sprintf(" · ~%s tokens%s", humanTokens(p.Tokens), tb)
+	}
+	return fmt.Sprintf("hindcast: ~%s wall / %s active%s%s · %s n=%d · %s",
+		wall, active, band, tokenPhrase, src, p.N, tag)
+}
+
+// humanTokens renders a token count compactly: "164", "37K", "2.4M".
+// Used by the token band in the inject and CLI.
+func humanTokens(t int) string {
+	switch {
+	case t <= 0:
+		return "0"
+	case t < 1000:
+		return fmt.Sprintf("%d", t)
+	case t < 1_000_000:
+		if k := (t + 500) / 1000; k < 1000 {
+			return fmt.Sprintf("%dK", k)
+		}
+		return "1.0M" // 999_500..999_999 rounds up to the M boundary
+	default:
+		return fmt.Sprintf("%.1fM", float64(t)/1_000_000)
+	}
 }
 
 // humanDuration renders seconds as a compact minutes/seconds string.

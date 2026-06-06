@@ -230,6 +230,44 @@ func formatClaudeInjection(p predict.Prediction) string {
 		fmt.Fprintf(&b, "  wall ~%s%s%s\n",
 			humanDuration(p.WallSeconds), band, activePhrase)
 	}
+
+	// Token-cost band (schema v2). Off by default — gated on HINDCAST_TOKENS.
+	// The signal is measured like wall (not judged), but adding a new
+	// injected dimension is an explicit opt-in per the anti-anchoring
+	// discipline, not a silent default. Only calibrated tiers populate
+	// p.Tokens, and it stays zero until enough token-bearing turns accrue.
+	tokenShown := false
+	if os.Getenv("HINDCAST_TOKENS") == "1" && p.Tokens > 0 {
+		tokenShown = true
+		// Variance gate on TokensN (token support), NOT wall's N: token cost
+		// is sparse and its band rests on a smaller, filtered subset of the
+		// neighbors that backed wall. (MaxSim stays a proxy — we don't track
+		// the token subset's own top similarity separately.) The "(n=K)"
+		// citation surfaces that support so the figure isn't read as backed
+		// by wall's N.
+		tokThreshold := 3.0
+		if p.Source == predict.SourceKNN && (p.TokensN < 5 || p.MaxSim < 0.4) {
+			tokThreshold = 2.0
+		}
+		tokHighVar := p.TokensP25 > 0 && p.TokensP75 > 0 && float64(p.TokensP75)/float64(p.TokensP25) > tokThreshold
+		if tokHighVar {
+			lo, hi := p.TokensP25, p.TokensP75
+			bandLabel := "P25–P75"
+			if p.TokensP10 > 0 && p.TokensP90 > 0 {
+				lo, hi = p.TokensP10, p.TokensP90
+				bandLabel = "P10–P90"
+			}
+			fmt.Fprintf(&b, "  tokens %s–%s (high uncertainty; %s band, n=%d)\n",
+				humanTokens(lo), humanTokens(hi), bandLabel, p.TokensN)
+		} else {
+			tb := ""
+			if p.TokensP25 > 0 && p.TokensP75 >= p.TokensP25 {
+				tb = fmt.Sprintf(" (P25–P75: %s–%s)", humanTokens(p.TokensP25), humanTokens(p.TokensP75))
+			}
+			fmt.Fprintf(&b, "  tokens ~%s%s (n=%d)\n", humanTokens(p.Tokens), tb, p.TokensN)
+		}
+	}
+
 	fmt.Fprintf(&b, "  source: %s · n=%d", src, p.N)
 	if p.TaskType != "" {
 		fmt.Fprintf(&b, " · task=%s", p.TaskType)
@@ -241,6 +279,12 @@ func formatClaudeInjection(p predict.Prediction) string {
 	b.WriteString("the predictor cannot see (much larger scope, blocked on long external\n")
 	b.WriteString("process, etc.) — say so explicitly. Do NOT pad the override out of caution;\n")
 	b.WriteString("decompose into verify-existing vs implement-fresh and estimate each tightly.")
+	if tokenShown {
+		b.WriteString("\n\nThe token figure is this turn's likely cost (main output + any subagent\n")
+		b.WriteString("fan-out), calibrated from past turns. Use it to size fan-outs before\n")
+		b.WriteString("launching — a Workflow/Agent breadth that implies far above the band is\n")
+		b.WriteString("worth a second look. Same discipline: cite the band, don't pad.")
+	}
 	return b.String()
 }
 
@@ -267,6 +311,11 @@ func computePrediction(hash string, tokens []uint64, taskType, sessionID string,
 
 	if pred, ok := tryRegressorPrediction(tokens, taskType, promptChars, records, idx); ok {
 		pred.SessionID = sessionID
+		// Note: the regressor predicts wall only — pred carries no token
+		// fields, so when it wins the token band is intentionally absent
+		// (the inject suppresses a zero p.Tokens). v1 limitation; don't
+		// "fix" by faking a token band from wall. The ladder path below
+		// populates tokens for users where the regressor doesn't win.
 		return pred
 	}
 

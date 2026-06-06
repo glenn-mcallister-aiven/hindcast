@@ -16,6 +16,8 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -35,7 +37,24 @@ type Turn struct {
 	FilesTouched  int
 	Model         string
 	ActiveSeconds int
+
+	// Token cost (v2). OutputTokens is the main session's generated
+	// tokens (summed assistant usage.output_tokens — NOT input/cache,
+	// which re-count the whole context every message and would balloon).
+	// SubagentTokens sums the `<usage>subagent_tokens: N` footers that
+	// every completed subagent (Task/Agent or Workflow) reports back into
+	// the parent transcript's tool_result text — the fan-out cost the
+	// main session is otherwise blind to. AgentCount is how many such
+	// completions this turn saw. TokenCost() is the headline metric.
+	OutputTokens   int
+	SubagentTokens int
+	AgentCount     int
 }
+
+// TokenCost is the headline token metric for a turn: generative work in
+// the main session plus the rolled-up cost of any subagent fan-out. Cache
+// reads and re-counted input tokens are deliberately excluded.
+func (t Turn) TokenCost() int { return t.OutputTokens + t.SubagentTokens }
 
 // WallSeconds is a convenience derived from PromptTS and StopTS.
 func (t Turn) WallSeconds() int {
@@ -65,16 +84,91 @@ type rawEntry struct {
 }
 
 type rawMessage struct {
+	ID      string          `json:"id"`
 	Role    string          `json:"role"`
 	Model   string          `json:"model"`
 	Content json.RawMessage `json:"content"`
+	Usage   *usage          `json:"usage,omitempty"`
+}
+
+type usage struct {
+	OutputTokens int `json:"output_tokens"`
+}
+
+// subagentTokensRe matches the `<usage>subagent_tokens: N` footer Claude
+// Code appends to a completed subagent's tool_result (verified identical
+// for Task/Agent and Workflow subagents).
+//
+// Attribution, not just matching, is what keeps this honest. A bare regex
+// over all tool_result text over-counts badly: any Bash/Read/Grep that
+// echoes transcript bytes — or a subagent narrative that quotes a footer —
+// looks identical to a real footer (measured 18-of-20 footers false on this
+// project's own dev sessions, which read transcripts). So scanning is gated
+// two ways in Parse: (1) only tool_result blocks whose originating tool_use
+// is a subagent spawner (isSubagentTool) are scanned, which drops the
+// Bash/Read echoes entirely; (2) within such a block only the LAST footer
+// counts — CC appends exactly one, trailing, so an earlier match is the
+// subagent quoting a footer in its own output. The `<usage>` anchor is
+// retained as defense-in-depth.
+var subagentTokensRe = regexp.MustCompile(`<usage>\s*subagent_tokens:\s*(\d+)`)
+
+// isSubagentTool reports whether a tool_use of this name spawns a subagent
+// that reports a token footer back to the parent. Bash/Read/Grep/etc. do
+// not — and their results are exactly what echoes footer text.
+func isSubagentTool(name string) bool {
+	switch name {
+	case "Task", "Agent", "Workflow":
+		return true
+	}
+	return false
+}
+
+// lastSubagentFooter returns the value of the LAST <usage>subagent_tokens
+// footer in text (CC appends it at the very end of a subagent result; any
+// earlier match is quoted narrative). ok is false when there is none.
+func lastSubagentFooter(text string) (int, bool) {
+	ms := subagentTokensRe.FindAllStringSubmatch(text, -1)
+	if len(ms) == 0 {
+		return 0, false
+	}
+	v, err := strconv.Atoi(ms[len(ms)-1][1])
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+// toolResultText extracts the text payload of a tool_result block's content,
+// which CC encodes as either a bare string or an array of text blocks.
+func toolResultText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s
+	}
+	var arr []contentBlock
+	if json.Unmarshal(raw, &arr) == nil {
+		var b strings.Builder
+		for _, blk := range arr {
+			if blk.Type == "text" {
+				b.WriteString(blk.Text)
+			}
+		}
+		return b.String()
+	}
+	return ""
 }
 
 type contentBlock struct {
-	Type  string          `json:"type"`
-	Text  string          `json:"text,omitempty"`
-	Name  string          `json:"name,omitempty"`
-	Input json.RawMessage `json:"input,omitempty"`
+	Type      string          `json:"type"`
+	Text      string          `json:"text,omitempty"`
+	Name      string          `json:"name,omitempty"`
+	Input     json.RawMessage `json:"input,omitempty"`
+	ID        string          `json:"id,omitempty"`          // tool_use id
+	ToolUseID string          `json:"tool_use_id,omitempty"` // tool_result → its tool_use
+	Content   json.RawMessage `json:"content,omitempty"`     // tool_result nested payload
 }
 
 // Parse reads a transcript from r and returns all turns whose PromptTS
@@ -87,6 +181,16 @@ func Parse(r io.Reader, since time.Time) ([]Turn, error) {
 	var curr *Turn
 	var lastTool time.Time
 	filePaths := map[string]bool{}
+	// tool_use ids that spawned a subagent — populated as assistant
+	// tool_use blocks stream past, consumed when their tool_result arrives.
+	// Lets us count footers only from real subagent results, not from
+	// Bash/Read output that happens to echo transcript text.
+	subagentIDs := map[string]bool{}
+	// Assistant message ids whose usage we've already counted. CC writes one
+	// JSONL entry per content block (thinking / text / tool_use) and repeats
+	// the SAME message.id and usage.output_tokens on each — so a naive
+	// per-entry sum inflates OutputTokens ~2-2.5x. Count usage once per id.
+	countedUsage := map[string]bool{}
 
 	finalize := func() {
 		if curr == nil {
@@ -114,6 +218,22 @@ func Parse(r io.Reader, since time.Time) ([]Turn, error) {
 		switch e.Type {
 		case "user":
 			if !isNewUserPrompt(m.Content) {
+				// Tool-result injection (not a turn boundary). Harvest the
+				// subagent fan-out cost reported back to the parent — but
+				// ONLY from tool_results whose tool_use was a subagent
+				// spawner, and only the trailing footer of each. See
+				// subagentTokensRe for why both gates matter.
+				if curr != nil {
+					for _, b := range extractBlocks(m.Content) {
+						if b.Type != "tool_result" || !subagentIDs[b.ToolUseID] {
+							continue
+						}
+						if v, ok := lastSubagentFooter(toolResultText(b.Content)); ok {
+							curr.SubagentTokens += v
+							curr.AgentCount++
+						}
+					}
+				}
 				continue
 			}
 			finalize()
@@ -132,6 +252,12 @@ func Parse(r io.Reader, since time.Time) ([]Turn, error) {
 			curr.StopTS = e.Timestamp
 			if m.Model != "" && curr.Model == "" {
 				curr.Model = m.Model
+			}
+			if m.Usage != nil && (m.ID == "" || !countedUsage[m.ID]) {
+				curr.OutputTokens += m.Usage.OutputTokens
+				if m.ID != "" {
+					countedUsage[m.ID] = true
+				}
 			}
 			blocks := extractBlocks(m.Content)
 			for _, b := range blocks {
@@ -155,6 +281,9 @@ func Parse(r io.Reader, since time.Time) ([]Turn, error) {
 					}
 				case "tool_use":
 					curr.ToolCalls[b.Name]++
+					if isSubagentTool(b.Name) && b.ID != "" {
+						subagentIDs[b.ID] = true
+					}
 					if !lastTool.IsZero() {
 						gap := e.Timestamp.Sub(lastTool)
 						if gap > activeGapCap {

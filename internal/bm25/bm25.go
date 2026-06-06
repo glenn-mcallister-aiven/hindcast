@@ -50,6 +50,10 @@ type Doc struct {
 	SizeBucket    string
 	ToolCount     int
 	FilesTouched  int
+	// Tokens is the turn's headline token cost (main output + subagent
+	// fan-out). Zero on pre-v2 docs — predict.Predict skips those for the
+	// token tier so old indexes don't drag the median to zero.
+	Tokens int
 	// v0.6.3: turn timestamp for kNN freshness weighting. Zero on
 	// pre-v0.6.3 docs — predict.Predict treats those as freshness-
 	// neutral so existing indexes don't degrade until they refresh.

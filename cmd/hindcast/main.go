@@ -10,11 +10,55 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime/debug"
 
 	"github.com/justinstimatze/hindcast/internal/hook"
 )
 
-const version = "0.6.7"
+// version is "dev" by default and baked at release time via
+//
+//	go install -ldflags "-X main.version=$(git describe --tags --always --dirty)" ./cmd/hindcast
+//
+// The git tag is the single source of truth — there is no hand-maintained
+// version constant to drift out of sync. buildVersion() resolves it.
+var version = "dev"
+
+// buildVersion reports the binary's version, preferring (in order): a
+// release value baked in via -ldflags; the module version when installed
+// with `go install …@vX.Y.Z`; the embedded VCS commit (+dirty) for local
+// `go build`. Falls back to "dev" when none is available (e.g. a tarball
+// build outside a git tree).
+func buildVersion() string {
+	if version != "dev" {
+		return version
+	}
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		return version
+	}
+	if v := bi.Main.Version; v != "" && v != "(devel)" {
+		return v
+	}
+	var rev, dirty string
+	for _, s := range bi.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			if len(s.Value) >= 12 {
+				rev = s.Value[:12]
+			} else {
+				rev = s.Value
+			}
+		case "vcs.modified":
+			if s.Value == "true" {
+				dirty = "-dirty"
+			}
+		}
+	}
+	if rev != "" {
+		return rev + dirty
+	}
+	return version
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -81,7 +125,7 @@ func main() {
 		cmdTrain(args[1:])
 
 	case "version", "--version", "-v":
-		fmt.Println("hindcast", version)
+		fmt.Println("hindcast", buildVersion())
 	case "help", "--help", "-h":
 		usage(os.Stdout)
 	default:

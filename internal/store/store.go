@@ -49,14 +49,27 @@ type Record struct {
 	Interrupted         bool           `json:"interrupted,omitempty"`
 	Partial             bool           `json:"partial,omitempty"`
 
+	// Token cost (schema v2). Measured, like wall/active — recovered from
+	// the transcript, never judged. OutputTokens is main-session generated
+	// tokens; SubagentTokens is the rolled-up cost of any fan-out (Agent /
+	// Workflow subagents); AgentCount is how many subagents the turn spawned.
+	// Zero on pre-v2 records — predictors skip those for the token tier.
+	OutputTokens   int `json:"output_tokens,omitempty"`
+	SubagentTokens int `json:"subagent_tokens,omitempty"`
+	AgentCount     int `json:"agent_count,omitempty"`
+
 	// A/B calibration fields (tier 3).
 	Arm                  string `json:"arm,omitempty"`                    // "control" | "treatment"
 	ClaudeEstimateWall   int    `json:"claude_estimate_wall,omitempty"`   // seconds, parsed from <!-- hindcast-wall: ... -->
 	ClaudeEstimateActive int    `json:"claude_estimate_active,omitempty"` // seconds, parsed from <!-- hindcast-active: ... -->
 }
 
+// TokenCost is the headline token metric: main-session generative work
+// plus rolled-up subagent fan-out cost. Mirrors transcript.Turn.TokenCost.
+func (r Record) TokenCost() int { return r.OutputTokens + r.SubagentTokens }
+
 const (
-	SchemaVersion   = 1
+	SchemaVersion   = 2 // v2: token cost fields (output/subagent/agent_count)
 	MaxRecordSize   = 4096
 	LogRotateSize   = 10 * 1024 * 1024
 	SketchMaxWindow = 1000

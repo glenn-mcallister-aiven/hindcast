@@ -150,6 +150,9 @@ func cmdBackfill(args []string) {
 				ResponseChars:       t.ResponseChars,
 				ToolCalls:           t.ToolCalls,
 				FilesTouched:        t.FilesTouched,
+				OutputTokens:        t.OutputTokens,
+				SubagentTokens:      t.SubagentTokens,
+				AgentCount:          t.AgentCount,
 			}
 			// Skip turns with zero wall — usually means an incomplete turn
 			// (interrupted or malformed). They pollute medians.
@@ -173,6 +176,7 @@ func cmdBackfill(args []string) {
 					SizeBucket:    r.SizeBucket,
 					ToolCount:     toolCount,
 					FilesTouched:  r.FilesTouched,
+					Tokens:        r.TokenCost(),
 					TS:            r.TS,
 				})
 			}

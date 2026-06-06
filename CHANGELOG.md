@@ -4,6 +4,42 @@
 
 (none)
 
+## [0.7.0] — 2026-06-06 — token-cost dimension
+
+Adds a token-cost prediction dimension alongside wall/active, reusing the
+kNN → bucket → project ladder. Tokens are *measured* (recovered from the
+transcript like wall/active), not judged. Schema bumped 1 → 2 (additive;
+old records/indexes read fine, contributing zero to the token tier until
+they refresh). Recording is always on; the **injected** token line is off
+by default behind `HINDCAST_TOKENS=1`, per the anti-anchoring discipline —
+record and predict first, inject only on an explicit opt-in.
+
+### Added
+
+- **Token cost per turn.** `OutputTokens` (main-session generated tokens,
+  deduped per `message.id`), `SubagentTokens` (rolled-up fan-out cost from
+  `<usage>subagent_tokens` footers), `AgentCount`. `TokenCost()` = output +
+  subagent. Pure backfill from existing transcripts — no new
+  instrumentation, no sidechain reading.
+- **Token band in the predictor.** `predict.Prediction` gains
+  `Tokens` / `TokensP25/P75/P10/P90` / `TokensN`, computed with the same
+  weighted-kNN-plus-shrinkage (and unweighted bucket/project) machinery as
+  wall. `hindcast predict` shows the band; the inject renders it only under
+  `HINDCAST_TOKENS=1`, gated by tier and a token-specific variance check.
+
+### Real bugs (caught by adversarial review before release)
+
+- **Subagent footer over-count.** A bare `subagent_tokens:` scan counted
+  any tool_result that *echoes* transcript text — a Bash/Read/grep of a
+  `.jsonl`, or a subagent quoting a footer (measured 18-of-20 footers false
+  on transcript-reading sessions). Fixed by attributing footers to their
+  originating tool_use: only Task/Agent/Workflow results are scanned, and
+  only the trailing footer per result block counts.
+- **`output_tokens` inflated ~2.5×.** Claude Code writes one JSONL entry
+  per content block, repeating the same `message.id` and `usage`. Naive
+  per-entry summing over-counted a single response; now deduped per message
+  id (627K → 322K on this project's own session).
+
 ## [0.6.7] — 2026-05-01 — round-3 audit cleanup
 
 Closes the round-3 pre-public audit findings.

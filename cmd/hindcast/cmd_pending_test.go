@@ -119,6 +119,42 @@ func TestFormatClaudeInjectionDontPadGuidance(t *testing.T) {
 	}
 }
 
+// TestFormatClaudeInjectionTokenGate exercises the HINDCAST_TOKENS gate:
+// the token band is off by default (anti-anchoring discipline) and only
+// renders when the env flag is set AND a tier populated p.Tokens.
+func TestFormatClaudeInjectionTokenGate(t *testing.T) {
+	p := predict.Prediction{
+		Source: predict.SourceKNN, WallSeconds: 60,
+		WallP25: 45, WallP75: 90, N: 5, MaxSim: 0.8,
+		Tokens: 200_000, TokensP25: 100_000, TokensP75: 300_000, TokensN: 5,
+	}
+
+	// Default (flag unset) → no token line.
+	t.Setenv("HINDCAST_TOKENS", "")
+	if got := formatClaudeInjection(p); strings.Contains(got, "tokens") {
+		t.Errorf("token line must be suppressed by default, got:\n%s", got)
+	}
+
+	// Flag on → token line renders with the band and its own support count.
+	t.Setenv("HINDCAST_TOKENS", "1")
+	got := formatClaudeInjection(p)
+	if !strings.Contains(got, "tokens ~200K") {
+		t.Errorf("expected token point+band, got:\n%s", got)
+	}
+	if !strings.Contains(got, "100K–300K") {
+		t.Errorf("expected P25–P75 token band, got:\n%s", got)
+	}
+	if !strings.Contains(got, "n=5") {
+		t.Errorf("expected token support count (n=5), got:\n%s", got)
+	}
+
+	// Flag on but no token data → still suppressed (zero Tokens).
+	p2 := predict.Prediction{Source: predict.SourceKNN, WallSeconds: 60, WallP25: 45, WallP75: 90, N: 5}
+	if got := formatClaudeInjection(p2); strings.Contains(got, "tokens") {
+		t.Errorf("token line must stay silent with zero Tokens, got:\n%s", got)
+	}
+}
+
 // TestFormatClaudeInjectionSourceRendering verifies per-source label,
 // including the regressor-without-SourceDetail fallback (we want the
 // label to degrade to "regressor", not blank).

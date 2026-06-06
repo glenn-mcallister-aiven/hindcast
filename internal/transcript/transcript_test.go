@@ -2,6 +2,7 @@ package transcript
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -80,6 +81,114 @@ func TestParseFileSince(t *testing.T) {
 	}
 	if turns[0].PromptText != "fix the test flake in auth" {
 		t.Errorf("filtered turn prompt = %q", turns[0].PromptText)
+	}
+}
+
+// CC writes one JSONL entry per content block of a single assistant
+// response (thinking / text / tool_use), each repeating the SAME message.id
+// and usage.output_tokens. OutputTokens must count each response's usage
+// once, not once per block — else it inflates ~2-2.5x.
+func TestParseTokenCostDedupesUsagePerMessageID(t *testing.T) {
+	lines := []string{
+		`{"type":"user","timestamp":"2026-06-06T10:00:00Z","message":{"role":"user","content":"do it"}}`,
+		// One response, three split entries, same id "m1", usage repeated.
+		`{"type":"assistant","timestamp":"2026-06-06T10:00:05Z","message":{"id":"m1","role":"assistant","content":[{"type":"text","text":"thinking"}],"usage":{"output_tokens":164}}}`,
+		`{"type":"assistant","timestamp":"2026-06-06T10:00:06Z","message":{"id":"m1","role":"assistant","content":[{"type":"tool_use","id":"x1","name":"Bash","input":{}}],"usage":{"output_tokens":164}}}`,
+		`{"type":"assistant","timestamp":"2026-06-06T10:00:07Z","message":{"id":"m1","role":"assistant","content":[{"type":"tool_use","id":"x2","name":"Bash","input":{}}],"usage":{"output_tokens":164}}}`,
+		// A genuinely separate second response.
+		`{"type":"assistant","timestamp":"2026-06-06T10:00:10Z","message":{"id":"m2","role":"assistant","content":[{"type":"text","text":"done"}],"usage":{"output_tokens":40}}}`,
+	}
+	turns, err := Parse(strings.NewReader(strings.Join(lines, "\n")), time.Time{})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if turns[0].OutputTokens != 204 {
+		t.Errorf("OutputTokens = %d, want 204 (164 once + 40), not per-block inflation", turns[0].OutputTokens)
+	}
+}
+
+func TestParseTokenCost(t *testing.T) {
+	// One turn that spawns two subagents. Main-session output_tokens come
+	// from assistant usage; subagent fan-out cost comes from the
+	// <usage>subagent_tokens:N</usage> footers in the tool_result blocks
+	// (which arrive as non-new-prompt "user" messages).
+	lines := []string{
+		`{"type":"user","timestamp":"2026-06-06T10:00:00Z","message":{"role":"user","content":"migrate the tests"}}`,
+		`{"type":"assistant","timestamp":"2026-06-06T10:00:05Z","message":{"role":"assistant","model":"claude-opus-4-8","content":[{"type":"tool_use","id":"t1","name":"Task","input":{}}],"usage":{"output_tokens":120}}}`,
+		`{"type":"user","timestamp":"2026-06-06T10:01:00Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"done (you cannot continue this agent)\n<usage>subagent_tokens: 36768\ntool_uses: 6\nduration_ms: 3442</usage>"}]}]}}`,
+		`{"type":"assistant","timestamp":"2026-06-06T10:01:05Z","message":{"role":"assistant","model":"claude-opus-4-8","content":[{"type":"tool_use","id":"t2","name":"Task","input":{}}],"usage":{"output_tokens":80}}}`,
+		`{"type":"user","timestamp":"2026-06-06T10:02:00Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","content":[{"type":"text","text":"ok\n<usage>subagent_tokens: 21776\ntool_uses: 11\nduration_ms: 9000</usage>"}]}]}}`,
+		`{"type":"assistant","timestamp":"2026-06-06T10:02:10Z","message":{"role":"assistant","model":"claude-opus-4-8","content":[{"type":"text","text":"all migrated"}],"usage":{"output_tokens":40}}}`,
+	}
+	turns, err := Parse(strings.NewReader(strings.Join(lines, "\n")), time.Time{})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(turns) != 1 {
+		t.Fatalf("want 1 turn, got %d", len(turns))
+	}
+	tr := turns[0]
+	if tr.OutputTokens != 240 {
+		t.Errorf("OutputTokens = %d, want 240 (120+80+40)", tr.OutputTokens)
+	}
+	if tr.SubagentTokens != 58544 {
+		t.Errorf("SubagentTokens = %d, want 58544 (36768+21776)", tr.SubagentTokens)
+	}
+	if tr.AgentCount != 2 {
+		t.Errorf("AgentCount = %d, want 2", tr.AgentCount)
+	}
+	if got := tr.TokenCost(); got != 58784 {
+		t.Errorf("TokenCost() = %d, want 58784", got)
+	}
+}
+
+// A Bash/Read tool_result that echoes transcript text — even a full,
+// well-formed `<usage>subagent_tokens:` footer (e.g. from `cat`-ing a
+// .jsonl) — must NOT count, because its originating tool is not a subagent
+// spawner. This is the over-count that poisoned transcript-reading sessions
+// before footers were attributed to their tool_use.
+func TestParseTokenCostIgnoresEchoedText(t *testing.T) {
+	lines := []string{
+		`{"type":"user","timestamp":"2026-06-06T10:00:00Z","message":{"role":"user","content":"how many subagent_tokens are in the log?"}}`,
+		`{"type":"assistant","timestamp":"2026-06-06T10:00:05Z","message":{"role":"assistant","model":"claude-opus-4-8","content":[{"type":"tool_use","id":"b1","name":"Bash","input":{}}],"usage":{"output_tokens":50}}}`,
+		// Bash result echoing a genuine-looking footer from a transcript dump.
+		`{"type":"user","timestamp":"2026-06-06T10:00:30Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"b1","content":[{"type":"text","text":"line: <usage>subagent_tokens: 99999\ntool_uses: 5\nduration_ms: 1000</usage>"}]}]}}`,
+		`{"type":"assistant","timestamp":"2026-06-06T10:00:40Z","message":{"role":"assistant","model":"claude-opus-4-8","content":[{"type":"text","text":"counted"}],"usage":{"output_tokens":20}}}`,
+	}
+	turns, err := Parse(strings.NewReader(strings.Join(lines, "\n")), time.Time{})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(turns) != 1 {
+		t.Fatalf("want 1 turn, got %d", len(turns))
+	}
+	if turns[0].SubagentTokens != 0 {
+		t.Errorf("SubagentTokens = %d, want 0 (Bash echo must not count)", turns[0].SubagentTokens)
+	}
+	if turns[0].AgentCount != 0 {
+		t.Errorf("AgentCount = %d, want 0", turns[0].AgentCount)
+	}
+}
+
+// A real subagent (Agent/Task) whose own narrative QUOTES a footer must
+// count only the trailing CC-appended footer, not the quoted one.
+func TestParseTokenCostTakesLastFooterPerResult(t *testing.T) {
+	lines := []string{
+		`{"type":"user","timestamp":"2026-06-06T10:00:00Z","message":{"role":"user","content":"review the diff"}}`,
+		`{"type":"assistant","timestamp":"2026-06-06T10:00:05Z","message":{"role":"assistant","model":"claude-opus-4-8","content":[{"type":"tool_use","id":"a1","name":"Agent","input":{}}],"usage":{"output_tokens":30}}}`,
+		// Agent result: narrative quotes a footer (11111), then CC appends the real one (44444).
+		`{"type":"user","timestamp":"2026-06-06T10:01:00Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"a1","content":[{"type":"text","text":"I found <usage>subagent_tokens: 11111</usage> in the log.\n\n<usage>subagent_tokens: 44444\ntool_uses: 9\nduration_ms: 5000</usage>"}]}]}}`,
+		`{"type":"assistant","timestamp":"2026-06-06T10:01:05Z","message":{"role":"assistant","model":"claude-opus-4-8","content":[{"type":"text","text":"done"}],"usage":{"output_tokens":10}}}`,
+	}
+	turns, err := Parse(strings.NewReader(strings.Join(lines, "\n")), time.Time{})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if turns[0].SubagentTokens != 44444 {
+		t.Errorf("SubagentTokens = %d, want 44444 (trailing footer only, not the quoted 11111)", turns[0].SubagentTokens)
+	}
+	if turns[0].AgentCount != 1 {
+		t.Errorf("AgentCount = %d, want 1", turns[0].AgentCount)
 	}
 }
 
