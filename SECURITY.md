@@ -75,7 +75,7 @@ The outcome judge is the one feature that makes a network call on the *hook path
 
 - The key is resolved via `ANTHROPIC_API_KEY` (env), a `.env` walking up from cwd, or a global `~/.config/hindcast/.env`. Keep that global file `chmod 600` — if it's group/other-readable, hindcast logs a warning to `hook.log` (a passive log, not a terminal prompt) and proceeds to use it.
 - Verdicts are cached at `~/.claude/hindcast/judge-cache/` — one small file per distinct turn holding only `{verdict, model, ts}` (**no prompt or response text**). The cache is a flat, global, content-hashed directory, not per-project. It is cleared by `uninstall` and by a 30-day age-based GC; `hindcast forget <project>` removes that project's `outcomes.jsonl` but **not** the global judge cache (it isn't project-keyed, so a single-project forget can't selectively purge it).
-- The model defaults to `claude-haiku-4-5`; override with `HINDCAST_JUDGE_MODEL`.
+- The model defaults to `claude-haiku-5-5`; override with `HINDCAST_JUDGE_MODEL`.
 
 If you work with NDA/client/sensitive repos, **leave `HINDCAST_JUDGE` unset** — the default build never sends turn content anywhere.
 

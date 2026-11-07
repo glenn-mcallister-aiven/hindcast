@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/justinstimatze/hindcast/internal/hook"
@@ -19,7 +20,10 @@ import (
 // defaultJudgeModel is the grader. Haiku: the judgment is coarse
 // (3 classes) and runs once per turn off the hot path, so the cheapest
 // capable model is the right call. Override with HINDCAST_JUDGE_MODEL.
-const defaultJudgeModel = "claude-haiku-4-5"
+//
+// Haiku 5.5 is $0.10/$0.50 per MTok (Haiku 4.5 was $1/$5). It thinks by default and
+// rejects thinking under a forced tool_choice, so the request disables it (see disableThinking).
+const defaultJudgeModel = "claude-haiku-5-5"
 
 // judgeHTTPTimeout bounds a single judge call. The judge runs inside the
 // Stop worker (30s budget) — keep well under it so a slow API call can't
@@ -104,6 +108,14 @@ func judgeTurn(prompt, response, toolsSummary string) (string, string, bool) {
 	return verdict, model, true
 }
 
+// disableThinking adds thinking:{type:disabled} for models that think by default (Haiku 5.x).
+// A forced tool_choice cannot run with thinking on; Haiku 4.5 needs no such field.
+func disableThinking(reqBody map[string]any, model string) {
+	if strings.Contains(model, "haiku-5") {
+		reqBody["thinking"] = map[string]any{"type": "disabled"}
+	}
+}
+
 // callJudgeAPI makes the single forced-tool call to the Messages API and
 // returns the verdict. Mirrors queryEstimate's request shape (same
 // headers, same forced-tool pattern). Single attempt — the judge is
@@ -135,6 +147,7 @@ func callJudgeAPI(apiKey, model, prompt, response, toolsSummary string) (string,
 		}},
 		"tool_choice": map[string]any{"type": "tool", "name": "record_outcome"},
 	}
+	disableThinking(reqBody, model)
 	body, err := json.Marshal(reqBody)
 	if err != nil {
 		return "", false
