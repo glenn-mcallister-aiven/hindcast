@@ -2,7 +2,14 @@
 
 ## Unreleased
 
-(none)
+### Fixed
+
+- **MCP server was never loaded.** `install` wrote `mcpServers.hindcast`
+  into `~/.claude/settings.json`, which Claude Code does not read MCP
+  servers from, so `hindcast_prior` / `hindcast_estimate` never reached
+  a session. Install now registers via `claude mcp add --scope user`
+  (printing the command if `claude` isn't on `PATH`) and removes the
+  stale settings.json entry; uninstall runs `claude mcp remove`.
 
 ## [0.7.1] — 2026-06-06 — token band "oven timer"
 
