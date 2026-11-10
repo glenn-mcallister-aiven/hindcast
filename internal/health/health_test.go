@@ -25,6 +25,29 @@ func TestComputeEmpty(t *testing.T) {
 	}
 }
 
+// The +Inf "never inject" sentinel must survive Save/Load. encoding/json
+// rejects ±Inf, so before the null encoding every Save with that verdict
+// failed and health.json was never written. A finite threshold must
+// round-trip unchanged too.
+func TestSaveLoadRoundTrip(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	for _, want := range []float64{math.Inf(1), 0.45} {
+		h := Compute(map[string][]store.Record{}, nil, 5)
+		h.TunedSimThreshold = want
+		if err := h.Save(); err != nil {
+			t.Fatalf("Save(threshold=%v): %v", want, err)
+		}
+		got, err := Load()
+		if err != nil {
+			t.Fatalf("Load(threshold=%v): %v", want, err)
+		}
+		if got.TunedSimThreshold != want || got.Verdict != h.Verdict {
+			t.Errorf("round-trip: got threshold=%v verdict=%q, want %v %q",
+				got.TunedSimThreshold, got.Verdict, want, h.Verdict)
+		}
+	}
+}
+
 // On synthetic data where every project's durations are flat (no learnable
 // signal beyond the bucket median), the regressor cannot beat the ladder.
 // RegressorWinner must be "none". Catches a regression where the lift

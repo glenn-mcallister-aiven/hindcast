@@ -134,6 +134,39 @@ func (h *Health) Save() error {
 	return os.Rename(tmpName, path)
 }
 
+// healthJSON is Health's wire form. encoding/json cannot encode ±Inf,
+// so the "never inject" sentinel (TunedSimThreshold = +Inf) would make
+// every Save fail. The outer pointer field shadows the embedded one
+// with the same JSON key, letting +Inf travel as null.
+type healthAlias Health // no methods → no MarshalJSON recursion
+type healthJSON struct {
+	*healthAlias
+	TunedSimThreshold *float64 `json:"tuned_sim_threshold"`
+}
+
+// MarshalJSON writes +Inf TunedSimThreshold as null.
+func (h Health) MarshalJSON() ([]byte, error) {
+	w := healthJSON{healthAlias: (*healthAlias)(&h)}
+	if !math.IsInf(h.TunedSimThreshold, 1) {
+		w.TunedSimThreshold = &h.TunedSimThreshold
+	}
+	return json.Marshal(w)
+}
+
+// UnmarshalJSON reads null or absent TunedSimThreshold as +Inf, so a
+// file missing the field fails closed (gate shut) rather than open.
+func (h *Health) UnmarshalJSON(data []byte) error {
+	w := healthJSON{healthAlias: (*healthAlias)(h)}
+	if err := json.Unmarshal(data, &w); err != nil {
+		return err
+	}
+	h.TunedSimThreshold = math.Inf(1)
+	if w.TunedSimThreshold != nil {
+		h.TunedSimThreshold = *w.TunedSimThreshold
+	}
+	return nil
+}
+
 // Load reads the persisted health, returning nil + error if absent.
 func Load() (*Health, error) {
 	path, err := HealthPath()
