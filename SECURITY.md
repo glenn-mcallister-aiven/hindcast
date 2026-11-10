@@ -101,6 +101,7 @@ Users who `hindcast install` over an older install will inherit whatever data th
 ### Install-time risks
 
 - `hindcast install` modifies `~/.claude/settings.json`. A timestamped backup is written first (`settings.json.hindcast-backup-YYYYMMDD-HHMMSS`). Backups are not auto-deleted; rotate them yourself if you re-install repeatedly.
+- `hindcast install` runs `claude mcp add --scope user hindcast` (after a `claude mcp remove` for idempotency), which writes to `~/.claude.json`. hindcast never edits that file directly.
 - Concurrent `hindcast install` invocations are not file-locked and can race. Don't run install in parallel.
 
 ### Supply chain
@@ -111,4 +112,4 @@ The module path is `github.com/justinstimatze/hindcast`. Install via `go install
 
 ### Uninstall guarantees
 
-`hindcast uninstall` removes hook and MCP entries from `settings.json` by matching the command path, strips no markers from CLAUDE.md (hindcast never writes to CLAUDE.md), and deletes `~/.claude/hindcast/` unless `--keep-data` is passed. One command, full removal.
+`hindcast uninstall` removes hook entries from `settings.json` by matching the command path, unregisters the MCP server via `claude mcp remove --scope user hindcast`, strips no markers from CLAUDE.md (hindcast never writes to CLAUDE.md), and deletes `~/.claude/hindcast/` unless `--keep-data` is passed. One command, full removal.

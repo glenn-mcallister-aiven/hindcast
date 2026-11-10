@@ -31,7 +31,7 @@ go install github.com/justinstimatze/hindcast/cmd/hindcast@latest
 hindcast install
 ```
 
-Two commands. Pure Go, no CGO, no network, ~5 MB binary. `install` merges three hooks + one MCP server into `~/.claude/settings.json` (timestamped backup), initializes a per-install salt, and backfills priors from your `~/.claude/projects/*/` history. Restart Claude Code and the next turn's prompt gets a calibrated prior in Claude's context.
+Two commands. Pure Go, no CGO, no network, ~5 MB binary. `install` merges three hooks into `~/.claude/settings.json` (timestamped backup), registers the MCP server at user scope via `claude mcp add` (or prints the command if `claude` isn't on `PATH`), initializes a per-install salt, and backfills priors from your `~/.claude/projects/*/` history. Restart Claude Code and the next turn's prompt gets a calibrated prior in Claude's context.
 
 To remove: `hindcast uninstall`.
 

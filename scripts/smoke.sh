@@ -16,18 +16,16 @@ go build -o "$HOME/hindcast" ./cmd/hindcast
 echo "→ install (no backfill)"
 "$HOME/hindcast" install --no-backfill
 
-echo "→ verify settings.json has all 4 registrations"
+echo "→ verify settings.json has all 3 hooks and no mcpServers entry"
 SETTINGS="$HOME/.claude/settings.json"
 test -f "$SETTINGS" || { echo "FAIL: no settings.json"; exit 1; }
-for sub in pending record inject mcp; do
-  if ! grep -q "hindcast $sub" "$SETTINGS" 2>/dev/null && ! grep -q "\"hindcast\"" "$SETTINGS" 2>/dev/null; then
-    # pending/record/inject appear as "hindcast <sub>"; mcp appears as mcpServers.hindcast
-    case "$sub" in
-      mcp) grep -q '"hindcast"' "$SETTINGS" || { echo "FAIL: missing $sub"; exit 1; } ;;
-      *)   grep -q "hindcast $sub" "$SETTINGS" || { echo "FAIL: missing $sub"; exit 1; } ;;
-    esac
-  fi
+for sub in pending record inject; do
+  grep -q "hindcast $sub" "$SETTINGS" || { echo "FAIL: missing $sub"; exit 1; }
 done
+# MCP is registered via `claude mcp add` (into ~/.claude.json), not here.
+if grep -q '"mcpServers"' "$SETTINGS"; then
+  echo "FAIL: settings.json should not carry mcpServers"; exit 1
+fi
 
 echo "→ verify hindcast dir was created"
 test -d "$HOME/.claude/hindcast" || { echo "FAIL: no hindcast dir"; exit 1; }

@@ -139,8 +139,9 @@ func usage(w io.Writer) {
 	fmt.Fprint(w, `hindcast — wall-clock estimation priors for Claude Code
 
 Usage:
-  hindcast install               Wire hooks + MCP into ~/.claude/settings.json,
-                                 initialize per-install salt, backfill from transcripts.
+  hindcast install               Wire hooks into ~/.claude/settings.json, register MCP
+                                 via claude mcp add, initialize per-install salt,
+                                 backfill from transcripts.
   hindcast uninstall             Remove hook/MCP entries and all stored data.
   hindcast show [--project P]    Dump what hindcast has recorded.
   hindcast status                Hook health check (tail of hook.log).

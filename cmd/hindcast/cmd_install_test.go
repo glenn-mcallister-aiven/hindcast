@@ -143,3 +143,57 @@ func TestIsLegacyHindcastStatusline(t *testing.T) {
 		}
 	}
 }
+
+// TestMergeDropsStaleMCPEntry: pre-fix installs wrote mcpServers.hindcast
+// into settings.json, which Claude Code ignores. Install must remove it
+// while leaving other servers alone.
+func TestMergeDropsStaleMCPEntry(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	existing := `{"mcpServers":{"hindcast":{"command":"/x/hindcast","args":["mcp"]},"other":{"command":"o"}}}`
+	if err := os.WriteFile(settingsPath, []byte(existing), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := mergeClaudeSettings("/usr/local/bin/hindcast"); err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+
+	got, _ := os.ReadFile(settingsPath)
+	var out map[string]any
+	_ = json.Unmarshal(got, &out)
+	mcps, _ := out["mcpServers"].(map[string]any)
+	if _, present := mcps["hindcast"]; present {
+		t.Errorf("stale mcpServers.hindcast should be removed, got:\n%s", got)
+	}
+	if _, present := mcps["other"]; !present {
+		t.Errorf("unrelated MCP server should be preserved, got:\n%s", got)
+	}
+}
+
+// TestRegisterMCPUsesClaudeCLI puts a fake `claude` on PATH that logs its
+// argv, and checks install/uninstall drive `claude mcp` at user scope.
+func TestRegisterMCPUsesClaudeCLI(t *testing.T) {
+	dir := t.TempDir()
+	log := filepath.Join(dir, "calls.log")
+	script := "#!/bin/sh\necho \"$@\" >> " + log + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "claude"), []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+
+	registerMCP("/usr/local/bin/hindcast")
+	unregisterMCP()
+
+	got, _ := os.ReadFile(log)
+	want := "mcp remove --scope user hindcast\n" +
+		"mcp add --scope user hindcast -- /usr/local/bin/hindcast mcp\n" +
+		"mcp remove --scope user hindcast\n"
+	if string(got) != want {
+		t.Errorf("claude calls:\n%s\nwant:\n%s", got, want)
+	}
+}

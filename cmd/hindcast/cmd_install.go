@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -47,7 +48,8 @@ func cmdInstall(args []string) {
 		fmt.Fprintf(os.Stderr, "  settings.json: %s\n", err)
 		os.Exit(1)
 	}
-	fmt.Fprintln(os.Stderr, "  settings.json: hooks + mcpServers merged")
+	fmt.Fprintln(os.Stderr, "  settings.json: hooks merged")
+	registerMCP(exe)
 
 	// Seed global sketch from embedded defaults if first-install.
 	seedIfEmpty()
@@ -78,8 +80,9 @@ func cmdUninstall(args []string) {
 	if err := unmergeClaudeSettings(); err != nil {
 		fmt.Fprintf(os.Stderr, "  settings.json: %s\n", err)
 	} else {
-		fmt.Fprintln(os.Stderr, "  settings.json: hindcast hooks + mcpServers removed")
+		fmt.Fprintln(os.Stderr, "  settings.json: hindcast hooks removed")
 	}
+	unregisterMCP()
 
 	if !*keepData {
 		if root, err := store.HindcastDir(); err == nil {
@@ -145,16 +148,11 @@ func mergeClaudeSettings(exe string) error {
 	addHook(hooks, "SessionStart", exe+" inject")
 	settings["hooks"] = hooks
 
-	mcps, _ := settings["mcpServers"].(map[string]any)
-	if mcps == nil {
-		mcps = map[string]any{}
-	}
-	mcps["hindcast"] = map[string]any{
-		"command": exe,
-		"args":    []any{"mcp"},
-		"env":     map[string]any{},
-	}
-	settings["mcpServers"] = mcps
+	// Migration: pre-fix installs wrote mcpServers.hindcast here, but
+	// Claude Code never reads MCP servers from settings.json (they live in
+	// ~/.claude.json, owned by `claude mcp`). Drop the inert entry; the
+	// real registration happens in registerMCP.
+	dropSettingsMCP(settings)
 
 	// v0.6 migration: pre-v0.6 installs wired `hindcast statusline` into
 	// settings.statusLine. The statusline subcommand no longer exists, so
@@ -264,13 +262,8 @@ func unmergeClaudeSettings() error {
 		}
 	}
 
-	mcps, _ := settings["mcpServers"].(map[string]any)
-	if mcps != nil {
-		delete(mcps, "hindcast")
-		if len(mcps) == 0 {
-			delete(settings, "mcpServers")
-		}
-	}
+	// Older installs also left an (inert) mcpServers.hindcast entry here.
+	dropSettingsMCP(settings)
 
 	// Also clean up any legacy v0.5-and-earlier `hindcast statusline`
 	// entry — the subcommand no longer exists.
@@ -285,6 +278,63 @@ func unmergeClaudeSettings() error {
 		return err
 	}
 	return os.WriteFile(path, append(out, '\n'), settingsMode)
+}
+
+func dropSettingsMCP(settings map[string]any) {
+	mcps, _ := settings["mcpServers"].(map[string]any)
+	if mcps == nil {
+		return
+	}
+	delete(mcps, "hindcast")
+	if len(mcps) == 0 {
+		delete(settings, "mcpServers")
+	}
+}
+
+// registerMCP registers the MCP server at user scope through the claude
+// CLI. We shell out rather than editing ~/.claude.json ourselves because
+// Claude Code owns that file and rewrites it while running, so a direct
+// edit can be clobbered. Remove-then-add makes re-install idempotent and
+// picks up a moved binary; `claude mcp add` refuses an existing name.
+// Failure is non-fatal: hooks still work without the MCP tools, so we
+// print the command for the user to run instead of aborting install.
+func registerMCP(exe string) {
+	manual := fmt.Sprintf("claude mcp add --scope user hindcast -- %s mcp", exe)
+	claude, err := exec.LookPath("claude")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  mcp: `claude` not on PATH; register manually:\n      %s\n", manual)
+		return
+	}
+	_ = claudeCmd(claude, "mcp", "remove", "--scope", "user", "hindcast").Run()
+	if out, err := claudeCmd(claude, "mcp", "add", "--scope", "user", "hindcast", "--", exe, "mcp").CombinedOutput(); err != nil {
+		fmt.Fprintf(os.Stderr, "  mcp: `claude mcp add` failed: %s\n%s  register manually:\n      %s\n", err, out, manual)
+		return
+	}
+	fmt.Fprintln(os.Stderr, "  mcp: registered at user scope (claude mcp add)")
+}
+
+// claudeCmd runs the claude CLI with its background telemetry/update
+// traffic disabled. `mcp add|remove` only edits ~/.claude.json, but the
+// bare CLI still phones home on startup; this keeps install offline.
+func claudeCmd(bin string, args ...string) *exec.Cmd {
+	cmd := exec.Command(bin, args...)
+	cmd.Env = append(os.Environ(), "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1")
+	return cmd
+}
+
+func unregisterMCP() {
+	manual := "claude mcp remove --scope user hindcast"
+	claude, err := exec.LookPath("claude")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  mcp: `claude` not on PATH; if registered, remove manually:\n      %s\n", manual)
+		return
+	}
+	// A non-zero exit here usually just means it was never registered.
+	if err := claudeCmd(claude, "mcp", "remove", "--scope", "user", "hindcast").Run(); err != nil {
+		fmt.Fprintln(os.Stderr, "  mcp: no user-scope hindcast server to remove")
+		return
+	}
+	fmt.Fprintln(os.Stderr, "  mcp: removed (claude mcp remove)")
 }
 
 // seedIfEmpty loads the embedded priors into the global sketch if no
