@@ -860,7 +860,11 @@ func cmdAutoTuneWorker() {
 	if lm, err := regressor.TrainLinearFromRecords(byProject, 20, 1.0); err == nil {
 		_ = lm.Save()
 	}
-	_ = h.Save()
+	if err := h.Save(); err != nil {
+		// Without a saved file shouldRetune() re-spawns this worker on
+		// every Stop, so surface the failure rather than discard it.
+		hook.Logf("autotune", "save health: %s", err)
+	}
 
 	// GC the judge cache on the same cadence: entries are single-use per
 	// turn and orphan on model/rubric changes, so age them out (30d) to
